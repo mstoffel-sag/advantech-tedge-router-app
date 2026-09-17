@@ -1,0 +1,89 @@
+#!/bin/sh
+# parameter-seed -- publish the current value of every parameter set as retained
+# twin data, so Cumulocity's Parameters tab shows the router's real state.
+#
+# Upstream's plugin relies on the separate `tedge-inventory` service to run
+# scripts.d snippets at boot; that component is not part of the thin-edge.io
+# standalone bundle, so the platform seeds the twins itself. Each parameter
+# plugin implements `get` (print its current values as JSON), which makes this
+# generic: the config files remain the single source of truth, whether they were
+# last changed from the Parameters tab, from configuration management or over SSH.
+#
+# A plugin may serve a whole FAMILY of sets (flow_params covers one set per
+# installed flow). Such a plugin implements `sets`, listing the types it
+# currently serves; each is then seeded with `get <type>`. Plugins that do not
+# understand `sets` are seeded once, under their own name.
+#
+# Runs once at start (backgrounded by etc/init), retrying until the local broker
+# is up, then exits -- it is NOT a long-running daemon (same shape as relay-seed).
+set -u
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+PLUGINS="$MOD_DIR/parameter-plugins"
+UPSTREAM_PLUGINS=/usr/share/tedge/parameter-plugins   # upstream's location, also honoured
+
+# find_plugin <name> -- the executable for a set, ours first, then upstream's.
+find_plugin() {
+    for d in "$PLUGINS" "$UPSTREAM_PLUGINS"; do
+        if [ -x "$d/$1" ]; then echo "$d/$1"; return 0; fi
+    done
+    return 1
+}
+SETTINGS="${MOD_PARAMETERS_SETTINGS:-$MOD_DIR/etc/parameters}"
+[ -f "$SETTINGS" ] && . "$SETTINGS"
+
+ENABLED="${MOD_PARAMETERS_ENABLED:-1}"
+SETS="${MOD_PARAMETERS_SETS:-Metrics Relay Container flow_params}"
+TWIN_BASE="${MOD_PARAMETERS_TWIN_BASE:-te/device/main///twin}"
+RETRIES="${MOD_PARAMETERS_SEED_RETRIES:-30}"
+
+[ "$ENABLED" = "1" ] || exit 0
+
+stamp() { date '+%F %T'; }
+
+# Build the work list as "<plugin>:<type>" tokens (neither name can contain a
+# colon or a space, so a plain word list is enough -- and it stays in this shell,
+# which the retry loop below needs).
+TODO=""
+for name in $SETS; do
+    if ! plugin=$(find_plugin "$name"); then
+        echo "$(stamp) parameter-seed: no plugin for '$name' ($PLUGINS/$name); skipped"
+        continue
+    fi
+    if types=$("$plugin" sets 2>/dev/null) && [ -n "$types" ]; then
+        for t in $types; do TODO="${TODO:+$TODO }$name:$t"; done
+    else
+        TODO="${TODO:+$TODO }$name:$name"
+    fi
+done
+[ -n "$TODO" ] || exit 0
+
+# Retry the whole batch until the local broker accepts the publishes. There is
+# no separate connectivity probe on purpose: a probe on a te/ twin topic would
+# itself create (or clear) a fragment on the device's managed object.
+n=0
+while [ "$n" -lt "$RETRIES" ]; do
+    pending=""
+    for item in $TODO; do
+        plugin=$(find_plugin "${item%%:*}") || continue
+        t="${item#*:}"
+        json=$("$plugin" get "$t" 2>/dev/null) || json=""
+        if [ -z "$json" ]; then
+            echo "$(stamp) parameter-seed: plugin for '$t' returned no values; skipped"
+            continue
+        fi
+        if tedge mqtt pub -r "$TWIN_BASE/$t" "$json" 2>/dev/null; then
+            echo "$(stamp) parameter-seed: published $t=$json"
+        else
+            pending="${pending:+$pending }$item"
+        fi
+    done
+    TODO="$pending"
+    [ -n "$TODO" ] || exit 0
+    n=$((n + 1))
+    sleep 2
+done
+
+echo "$(stamp) parameter-seed: broker unreachable after $RETRIES tries; not seeded: $TODO"
+exit 0

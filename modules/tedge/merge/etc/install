@@ -63,6 +63,45 @@ chmod +x /opt/tedge-data/etc/init 2>/dev/null || true
 # Make sure the bundled scripts are executable.
 chmod +x "$MOD_DIR/bin/"* "$MOD_DIR/etc/init" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Carry the operator's own artifacts across this upgrade.
+#
+# ICR-OS replaced /opt/tedge wholesale to get here, which destroys anything the
+# operator added inside it -- flows installed from Cumulocity's Software tab,
+# and the cloud-editable feature configs. bin/tedge-persist saved them to
+# /opt/tedge-data/persist (from etc/uninstall, which runs on an upgrade too, and
+# from etc/init stop); restore them now.
+#
+# First record which flows THIS version ships, so a later save can tell them
+# apart from the operator's. Anything already held in the persistent store is
+# the operator's by definition and is never recorded as shipped -- that keeps a
+# manual re-run of this script from disowning a flow.
+# Only directories are considered: the flows plugin installs a flow as a
+# directory, while the mapper's built-in flows are flat *.toml files it
+# regenerates at runtime (they are not in the package, so this manifest is
+# legitimately empty on a fresh install).
+install -d "$MOD_DIR/mappers" 2>/dev/null || true
+: > "$MOD_DIR/mappers/.shipped-flows"
+for d in "$MOD_DIR"/mappers/*/flows/*; do
+    [ -d "$d" ] || continue
+    fname=$(basename "$d")
+    fmapper=$(basename "$(dirname "$(dirname "$d")")")
+    [ -e "/opt/tedge-data/persist/flows/$fmapper/$fname" ] && continue
+    echo "$fmapper/$fname" >> "$MOD_DIR/mappers/.shipped-flows"
+done
+# Same for the parameter plugins: record what this version ships, so a later
+# save can tell them from the ones the operator dropped in.
+: > "$MOD_DIR/parameter-plugins/.shipped"
+for f in "$MOD_DIR"/parameter-plugins/*; do
+    [ -f "$f" ] || continue
+    pname=$(basename "$f")
+    case "$pname" in .*) continue ;; esac
+    [ -e "/opt/tedge-data/persist/parameter-plugins/$pname" ] && continue
+    echo "$pname" >> "$MOD_DIR/parameter-plugins/.shipped"
+done
+
+[ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" restore || true
+
 # Convenience: expose the tedge CLI on the system PATH.
 [ -d "$PREFIX/usr/bin" ] || mkdir -p "$PREFIX/usr/bin"
 [ -e "$PREFIX/usr/bin/tedge" ] || ln -sf "$MOD_DIR/bin/tedge" "$PREFIX/usr/bin/tedge"
@@ -116,6 +155,36 @@ fi
 # "relay" configuration type so it too is cloud-editable. No secrets.
 if [ -x "$MOD_DIR/bin/tedge-config-register" ] && [ -f "$MOD_DIR/etc/relay" ]; then
     "$MOD_DIR/bin/tedge-config-register" add relay "$MOD_DIR/etc/relay" relay || true
+fi
+
+# ---------------------------------------------------------------------------
+# Device parameters (c8y_ParameterUpdate), ported from thin-edge.io's
+# tedge-parameter-plugin.
+#
+# The workflow (operations/parameter_update.toml) and the Cumulocity operation
+# template (operations/c8y/c8y_ParameterUpdate.template) ship natively in this
+# platform dir, so nothing has to be symlinked: tedge-agent loads the workflow
+# and publishes the te/device/main///cmd/parameter_update capability, whereupon
+# the mapper links operations/c8y/c8y_ParameterUpdate to the template and
+# announces the operation. Here we only make the parameter-set plugins
+# executable and register the feature's own config file. Adding a parameter set
+# is a file drop into parameter-plugins/ (docs/EXTENSION-API.md, Pattern E).
+# ---------------------------------------------------------------------------
+chmod +x "$MOD_DIR/parameter-plugins/"* 2>/dev/null || true
+
+# Upstream compatibility: its package installs the dispatcher at
+# /usr/bin/parameter_update.sh and its plugins in /usr/share/tedge/parameter-
+# plugins, and community plugins / docs reference those paths. Provide the
+# script under its upstream name and create the upstream plugin directory, so a
+# plugin written against upstream drops in unchanged (bin/parameter-update
+# searches both directories).
+[ -d "$PREFIX/usr/bin" ] || mkdir -p "$PREFIX/usr/bin"
+[ -e "$PREFIX/usr/bin/parameter_update.sh" ] \
+    || ln -sf "$MOD_DIR/bin/parameter-update" "$PREFIX/usr/bin/parameter_update.sh"
+mkdir -p "$PREFIX/usr/share/tedge/parameter-plugins" 2>/dev/null || true
+
+if [ -x "$MOD_DIR/bin/tedge-config-register" ] && [ -f "$MOD_DIR/etc/parameters" ]; then
+    "$MOD_DIR/bin/tedge-config-register" add parameters "$MOD_DIR/etc/parameters" parameters || true
 fi
 
 # ---------------------------------------------------------------------------

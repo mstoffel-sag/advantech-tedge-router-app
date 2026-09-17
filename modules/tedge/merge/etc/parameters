@@ -1,0 +1,46 @@
+# thin-edge.io Router App -- device parameters configuration.
+#
+# Controls the built-in device-parameter feature: the Cumulocity
+# c8y_ParameterUpdate operation (workflow operations/parameter_update.toml,
+# dispatcher bin/parameter-update) which lets an operator change selected router
+# settings from Device Management > Parameters, with a typed form instead of a
+# raw config file. Each parameter set is a small script in
+# /opt/tedge/parameter-plugins/ that reads and writes one of this module's
+# config files (etc/metrics, etc/relay, etc/container) and reloads that feature.
+#
+# The values shown in the cloud are seeded at start by bin/parameter-seed and
+# refreshed after every update, so they always reflect the router's real state.
+#
+# Note: the parameter sets only become visible in the Cumulocity UI once the
+# matching property definitions exist in the tenant (Digital Twin Manager). See
+# scripts/c8y-parameter-definitions.sh in the Router App repository.
+#
+# This file is registered with thin-edge.io's configuration plugin as the
+# "parameters" configuration type, so it can be edited from Cumulocity as well
+# as over SSH. It contains no secrets.
+#
+# Apply changes with:  /opt/tedge/etc/init restart
+
+# Accept parameter updates from Cumulocity (1 = enabled, 0 = disabled). When
+# disabled, nothing is seeded and an incoming c8y_ParameterUpdate operation is
+# rejected (it fails with a reason) rather than silently ignored.
+MOD_PARAMETERS_ENABLED=1
+
+# Parameter sets exposed to the cloud -- a space-separated list of scripts in
+# /opt/tedge/parameter-plugins/. Remove a name to stop publishing and accepting
+# that set; add your own by dropping a script of that name into the directory
+# (see docs/EXTENSION-API.md, Pattern E).
+#   Metrics     the system-metrics poller   (etc/metrics)
+#   Relay       digital output control      (etc/relay)
+#   Container   container monitoring daemon (etc/container)
+#   flow_params a FAMILY: one set per installed thin-edge flow that has a
+#               params.toml (named flow_params_<mapper>_<flow>). Listing it
+#               costs nothing on a router without flows -- it then serves no
+#               sets at all.
+# Add your own by dropping an executable of that name into
+# /opt/tedge/parameter-plugins/ and listing it here -- it is then carried across
+# module upgrades like the flows and these config files (see bin/tedge-persist).
+# docs/examples/relayAutoOffTime in the Router App repository is a worked example
+# of a SCALAR set (a plain number rather than a field map), binding one flow
+# parameter to a Digital Twin Manager property of the same name.
+MOD_PARAMETERS_SETS="Metrics Relay Container flow_params"

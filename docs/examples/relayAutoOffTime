@@ -1,0 +1,107 @@
+#!/bin/sh
+# EXAMPLE parameter plugin: relayAutoOffTime (a SCALAR parameter set)
+#
+# NOT shipped by the Router App -- it is specific to one tenant's Digital Twin
+# Manager property and to a flow the app does not ship. Copy it to
+# /opt/tedge/parameter-plugins/relayAutoOffTime on a router that has both, add
+# the name to MOD_PARAMETERS_SETS in /opt/tedge/etc/parameters, and it will be
+# carried across module upgrades like any other operator-added plugin
+# (bin/tedge-persist). See docs/EXTENSION-API.md, Pattern E.
+#
+# Binds the Cumulocity parameter `relayAutoOffTime` to the delay of the
+# relay-auto-open flow: how many minutes a relay closed from Cumulocity may stay
+# closed before the flow opens it again. The value lives in that flow's
+# params.toml as `delay_minutes`; this plugin is the cloud-facing name for it.
+#
+#   relayAutoOffTime get              -- the current value (a bare JSON number)
+#   relayAutoOffTime set <json> <type> -- apply a new value, publish the twin
+#
+# SCALAR set: unlike Metrics/Relay/Container, the matching Digital Twin Manager
+# property is `"type": "number"`, not an object, so the operation carries a bare
+# number rather than a field map -- which upstream's dispatcher already passes
+# through untouched. Accepted: a bare number (`5`), or the object form
+# `{"relayAutoOffTime": 5}` that a field-map set would send. Anything else is
+# rejected. See docs/EXTENSION-API.md, Pattern E.
+#
+# If the flow is not installed on this router, `get` prints nothing -- which
+# makes parameter-seed skip the set and leaves the feature dormant rather than
+# advertising a parameter that cannot be applied.
+set -e
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+TYPE=relayAutoOffTime
+TOPIC="te/device/main///twin/$TYPE"
+
+# The flow this parameter drives, and the key inside its params.toml.
+FLOW_DIR="$MOD_DIR/mappers/c8y/flows/relay-auto-open"
+FLOW_KEY=delay_minutes
+
+JQ=$MOD_DIR/bin/jq
+[ -x "$JQ" ] || JQ=jq
+SETTOML="$MOD_DIR/bin/parameter-settoml"
+
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+params_file() {
+    if [ -f "$FLOW_DIR/params.toml" ]; then echo "$FLOW_DIR/params.toml"
+    elif [ -f "$FLOW_DIR/params.toml.template" ]; then echo "$FLOW_DIR/params.toml.template"
+    else return 1
+    fi
+}
+
+# The current delay_minutes, as a bare JSON number (nothing if unset/unreadable).
+get() {
+    f=$(params_file) || return 0
+    sed -n "s/^[[:space:]]*$FLOW_KEY[[:space:]]*=[[:space:]]*\([0-9.]\{1,\}\).*/\1/p" "$f" | head -1
+}
+
+# Accept a bare number or an object naming this parameter.
+extract_value() {
+    printf '%s' "$1" | "$JQ" -r --arg t "$TYPE" '
+        if type == "number" then .
+        elif type == "string" then (. | tonumber? // empty)
+        elif type == "object" then (.[$t] // empty)
+        else empty end' 2>/dev/null
+}
+
+update() {
+    # `|| true`: the payload is not always valid JSON. tedge substitutes
+    # ${.payload.parameters} as the raw value, so a JSON *string* arrives as a
+    # bare word (`soon`, not `"soon"`) which jq cannot parse -- and under
+    # `set -e` a failing command substitution would abort the script before it
+    # could explain itself, leaving the operator with a generic error.
+    v=$(extract_value "$1" || true)
+    if [ -z "$v" ]; then
+        echo "$TYPE expects a number (or {\"$TYPE\": <number>}), got: $1" >&2
+        exit 1
+    fi
+    if [ ! -d "$FLOW_DIR" ]; then
+        echo "the relay-auto-open flow is not installed on this device ($FLOW_DIR)" >&2
+        exit 1
+    fi
+
+    "$SETTOML" --check "$FLOW_DIR/params.toml" "$FLOW_KEY" "$v"
+    "$SETTOML" --write "$FLOW_DIR/params.toml" "$FLOW_KEY" "$v"
+    echo "Set $FLOW_KEY = $v in $FLOW_DIR/params.toml" >&2
+
+    # The flows mapper reloads on any change in the flow directory, so the new
+    # delay takes effect without restarting anything.
+    now=$(get)
+    [ -n "$now" ] && tedge mqtt pub -r "$TOPIC" "$now"
+
+    # Keep the flow's own parameter set in sync, if it is exposed too: both
+    # names describe the same value, and a stale twin is worse than a duplicate.
+    if [ -x "$MOD_DIR/parameter-plugins/flow_params" ]; then
+        tedge mqtt pub -r "te/device/main///twin/flow_params_c8y_relay-auto-open" \
+            "$("$MOD_DIR/parameter-plugins/flow_params" get flow_params_c8y_relay-auto-open)" || true
+    fi
+}
+
+case "$COMMAND" in
+    get)  get ;;
+    set)  update "${1:?parameters required}" ;;
+    init) v=$(get); [ -n "$v" ] && tedge mqtt pub -r "$TOPIC" "$v" ;;
+    *) echo "usage: $TYPE {get|set <json>|init}" >&2; exit 1 ;;
+esac

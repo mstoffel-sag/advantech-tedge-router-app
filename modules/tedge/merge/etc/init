@@ -160,7 +160,18 @@ EOT
             cert_path=$(tedge config get device.cert_path 2>/dev/null)
             if [ ! -f "$cert_path" ]; then
                 otp=$MOD_TEDGE_OTP
-                [ -n "$otp" ] || otp=$(printf "%s" "$dev_id" | md5sum | awk '{print $1}')
+                # Fall back to the documented md5-of-device-id -- but only if a
+                # digest tool exists. This firmware's busybox has no md5sum (nor
+                # sha*sum/cksum), where this silently produced an EMPTY one-time
+                # password and every registration attempt failed with no hint why.
+                if [ -z "$otp" ]; then
+                    if type md5sum >/dev/null 2>&1; then
+                        otp=$(printf "%s" "$dev_id" | md5sum | awk '{print $1}')
+                    else
+                        log "ERROR: no one-time password set and md5sum is not available on this firmware;"
+                        log "       set MOD_TEDGE_OTP in the module settings to the password you entered in Cumulocity."
+                    fi
+                fi
                 c8y_host=$(tedge config get c8y.url 2>/dev/null)
                 if [ -n "$c8y_host" ]; then
                     # Do NOT log the one-time password: log() writes to syslog
@@ -383,6 +394,38 @@ start_container() {
     log "container monitor started"
 }
 
+# ---------------------------------------------------------------------------
+# Device parameters (optional, enabled by default)
+#
+# Implements Cumulocity's c8y_ParameterUpdate operation: the workflow
+# operations/parameter_update.toml + the dispatcher bin/parameter-update hand an
+# incoming parameter set to the matching script in parameter-plugins/, which
+# writes this module's own config (etc/metrics, etc/relay, etc/container) and
+# reloads that feature. bin/parameter-seed publishes the current values as
+# retained twin data at start so the cloud shows the router's real state; it
+# exits once done (not a daemon), like relay-seed. Config in etc/parameters.
+# ---------------------------------------------------------------------------
+PARAM_CONF="$MOD_DIR/etc/parameters"
+
+parameters_enabled() {
+    [ -f "$PARAM_CONF" ] || return 1
+    enabled=$(. "$PARAM_CONF"; echo "${MOD_PARAMETERS_ENABLED:-1}")
+    [ "$enabled" = "1" ]
+}
+
+stop_parameters() {
+    pidof parameter-seed >/dev/null 2>&1 && kill $(pidof parameter-seed) 2>/dev/null
+    return 0
+}
+
+start_parameters() {
+    parameters_enabled || { log "device parameters disabled (set MOD_PARAMETERS_ENABLED=1 in etc/parameters)"; return 0; }
+    stop_parameters   # never leave two seeders running after a restart
+    "$BIN/parameter-seed" >> "$LOGDIR/parameter-seed.log" 2>&1 &
+    sets=$(. "$PARAM_CONF"; echo "${MOD_PARAMETERS_SETS:-}")
+    log "device parameters enabled (sets: $sets)"
+}
+
 start_tedge() {
     log "Starting $MOD_NAME"
 
@@ -421,6 +464,10 @@ start_tedge() {
     # Container monitoring daemon (gated by etc/container + engine presence).
     start_container
 
+    # Device parameters: seed the current values for the cloud (gated by
+    # etc/parameters). The operation itself needs no daemon.
+    start_parameters
+
     log "$MOD_NAME started"
 
     # Self-heal the c8y-ca first-connect subscription race (see the function).
@@ -429,6 +476,11 @@ start_tedge() {
 
 stop_tedge() {
     log "Stopping $MOD_NAME"
+    # Keep the upgrade-safe copy of the operator's flows and feature configs
+    # current (bin/tedge-persist). etc/uninstall does this too; doing it on every
+    # stop means an upgrade that skips uninstall still finds a recent copy.
+    [ -x "$BIN/tedge-persist" ] && "$BIN/tedge-persist" save >/dev/null 2>&1
+    stop_parameters
     stop_container
     stop_relay
     stop_metrics
@@ -462,6 +514,13 @@ status_tedge() {
     else
         echo "  tedge-container: disabled"
     fi
+    # Parameters need no daemon (the seeder exits once it has published), so
+    # report the feature state rather than a process state.
+    if parameters_enabled; then
+        echo "  parameters: enabled ($(. "$PARAM_CONF"; echo "${MOD_PARAMETERS_SETS:-none}"))"
+    else
+        echo "  parameters: disabled"
+    fi
     return $rc
 }
 
@@ -487,6 +546,19 @@ case "$1" in
         # once the service has settled.
         nohup "$MOD_DIR/etc/init" restart >>"$LOGDIR/apply.log" 2>&1 &
         echo "Configuration saved. thin-edge.io is restarting in the background."
+        ;;
+    reload)
+        # Restart a single built-in feature without bouncing the whole module
+        # (a full restart re-runs tedge connect and takes ~30 s). Used by the
+        # parameter plugins after they have written a new value, and handy for
+        # an operator who changed one of the etc/* config files over SSH.
+        case "${2:-}" in
+            metrics)   stop_metrics;    start_metrics ;;
+            relay)     stop_relay;      start_relay ;;
+            container) stop_container;  start_container ;;
+            parameters) stop_parameters; start_parameters ;;
+            *) echo "Usage: $0 reload {metrics|relay|container|parameters}" >&2; exit 1 ;;
+        esac
         ;;
     status)
         echo "Module $MOD_NAME:"
@@ -531,7 +603,7 @@ case "$1" in
         echo "Settings reset to defaults"
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|upload-cert|defaults}"
+        echo "Usage: $0 {start|stop|restart|reload <feature>|status|upload-cert|defaults}"
         exit 1
         ;;
 esac

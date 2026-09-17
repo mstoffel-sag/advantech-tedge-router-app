@@ -21,6 +21,8 @@ Once installed and enabled, the app:
 - manages **containers** (Docker/Podman) from Cumulocity via the bundled
   [tedge-container-plugin](https://github.com/thin-edge/tedge-container-plugin)
   (see [Container management](#container-management) below),
+- exposes the router's own settings as Cumulocity **device parameters**
+  (`c8y_ParameterUpdate`, see [Device parameters](#device-parameters) below),
 - connects securely using thin-edge.io's **built-in MQTT bridge over TLS** (the
   bundled Mosquitto is only the local broker, so no SSL config is needed on it).
 
@@ -37,8 +39,10 @@ advantec-tedge-router-app/
 ├── packages/
 │   ├── tedge/              # fetches + prepares the thin-edge.io standalone bundle
 │   │   └── Makefile        #   -> tedge-standalone-<ver>.<platform>.pkg
-│   └── tedge-container/    # fetches the tedge-container-plugin binary
-│       └── Makefile        #   -> tedge-container-<ver>.<platform>.pkg
+│   ├── tedge-container/    # fetches the tedge-container-plugin binary
+│   │   └── Makefile        #   -> tedge-container-<ver>.<platform>.pkg
+│   └── jq/                 # fetches the static jq binary (JSON, for parameters)
+│       └── Makefile        #   -> jq-<ver>.<platform>.pkg
 ├── modules/
 │   ├── Rules.mk            # platform compatibility matrix
 │   └── tedge/              # the Router App itself
@@ -49,13 +53,20 @@ advantec-tedge-router-app/
 │       │   ├── defaults    # configurable settings (shown in the web UI)
 │       │   ├── init        # service control: start|stop|restart|status
 │       │   ├── install     # first-install setup
-│       │   └── uninstall   # cleanup
+│       │   ├── uninstall   # cleanup
+│       │   └── metrics, relay, container, parameters  # per-feature config
+│       ├── merge/bin/      # on-router /opt/tedge/bin/* (pollers, helpers)
+│       ├── merge/operations/           # thin-edge workflows + c8y operations
+│       ├── merge/parameter-plugins/    # one script per Cumulocity parameter set
 │       └── source/         # the web interface (compiled CGI)
 │           ├── module_cgi.c    # config form, status page, system-log view
 │           ├── module_cfg.c/.h # read/write the settings file
 │           ├── module.h        # module name / paths
 │           └── Makefile        # -> /opt/tedge/{bin/cgi, www/*.cgi}
-├── scripts/setup-build-env.sh
+├── scripts/
+│   ├── setup-build-env.sh
+│   ├── new-extension.sh    # scaffold an add-on Router App
+│   └── c8y-parameter-definitions.sh   # tenant setup for Device Parameters
 └── docs/PLATFORMS.md       # ICR platform ↔ architecture reference
 ```
 
@@ -107,6 +118,104 @@ Configuration, types `container` and `tedge-container-plugin`). Container state
 container engine is **not** shipped with this app: install the **Advantech Docker
 Router App** (available on the `v4` / SL305 / ICR-3200 platforms) — the monitor
 detects it at `/opt/docker` and only runs when it is present.
+
+## Device parameters
+
+The app implements Cumulocity's [device parameters][c8y-params] feature
+(`c8y_ParameterUpdate`), ported from thin-edge.io's
+[tedge-parameter-plugin](https://github.com/thin-edge/tedge-parameter-plugin).
+It gives an operator a typed form in **Device Management → Parameters** for the
+router's own settings, instead of editing (or pushing) a whole config file.
+
+Four parameter sets ship with the app — one per built-in feature, plus one that
+covers the flows installed on the router:
+
+| Set | Fields | Backing file |
+|--|--|--|
+| `Metrics` | `enabled`, `interval`, `series`, `type` | `/opt/tedge/etc/metrics` |
+| `Relay` | `enabled`, `pollInterval`, `outputs`, `activeLow` | `/opt/tedge/etc/relay` |
+| `Container` | `enabled` | `/opt/tedge/etc/container` |
+| `flow_params_<mapper>_<flow>` | whatever that flow declares | `mappers/<mapper>/flows/<flow>/params.toml` |
+
+`flow_params_*` is a *family*: one set per installed thin-edge flow that has a
+`params.toml`, discovered at runtime (a router without flows simply has none).
+Keys are edited in place, so a flow's documenting comments survive an update —
+unlike upstream, which regenerates the file.
+
+A **scalar** set is also possible, where the Digital Twin Manager property is a
+plain `number` or `string` and the operation carries a bare value rather than a
+field map. [`docs/examples/relayAutoOffTime`](docs/examples/relayAutoOffTime) is
+a worked example, deliberately *not* shipped: it binds one cloud parameter to one
+flow setting under the cloud's own name, which makes it specific to a tenant's
+property and to a flow the app does not ship. Copy it onto a router that has
+both — it is then carried across upgrades like any operator-added plugin.
+
+How it works: `operations/parameter_update.toml` is a thin-edge workflow, so
+`tedge-agent` publishes the `parameter_update` capability and the c8y mapper
+announces `c8y_ParameterUpdate`. An incoming operation goes to
+`bin/parameter-update`, which hands the payload to the matching script in
+`/opt/tedge/parameter-plugins/`. That script writes the config file (through
+`bin/parameter-setconf`, which **validates every value** — these files are
+sourced as root, so a cloud-supplied value is never taken verbatim), reloads just
+that feature via `etc/init reload <feature>`, and republishes the digital twin.
+Fields the cloud does not send are left untouched, and a single invalid value
+rejects the whole update rather than half-applying it.
+
+When an update is refused, the **reason reaches Cumulocity**: the operation
+fails with e.g. `MOD_METRICS_POLL_INTERVAL expects an integer, got 'soon'`
+rather than a bare exit code, and the full workflow transcript is uploaded as an
+event attachment. The whole path — announcement, seeding, updates and every
+rejection case — is verified on hardware; see
+[docs/ON-DEVICE-VALIDATION-PARAMETERS.md](docs/ON-DEVICE-VALIDATION-PARAMETERS.md).
+
+`bin/parameter-seed` publishes the current values as retained twin data at every
+start, so the cloud always shows the router's real state — whether it was last
+changed from the Parameters tab, from configuration management or over SSH. (The
+upstream plugin relies on the separate `tedge-inventory` service for this, which
+is not part of the standalone bundle.) JSON parsing needs `jq`, which ICR-OS does
+not ship; it is bundled at `/opt/tedge/bin/jq` (see `packages/jq/`).
+
+**Tenant setup (once).** The device reports only two things — that it supports
+`c8y_ParameterUpdate`, and the current value as a twin fragment. There is no
+per-parameter device declaration. The **Parameters** tab renders from the
+tenant's Digital Twin Manager Property Library, so a set stays invisible until a
+property definition with the same identifier exists there, with the right
+`contexts` ("Applicable To"):
+
+| contexts | result |
+|--|--|
+| `asset`, `event` | the parameter is shown, read-only |
+| `asset`, `event`, `operation` | shown **and editable** (this is what sends `c8y_ParameterUpdate`) |
+| `asset` only | not shown |
+
+This also needs the `dtm` and `device-parameter` microservices (you may need a
+Cumulocity support ticket for those). Create the definitions with:
+
+```sh
+scripts/c8y-parameter-definitions.sh create          # or --dry to inspect first
+scripts/c8y-parameter-definitions.sh list
+```
+
+This needs an admin session: a device may not define tenant schemas (the device
+user is refused with `ROLE_DIGITAL_TWIN_DEFINITIONS_CREATE`). Flow sets need one
+definition per flow, whose fields come from that flow's `params.toml` — the
+script's header has a ready-made example.
+
+The feature is enabled by default and gated by `/opt/tedge/etc/parameters`
+(`MOD_PARAMETERS_ENABLED`, `MOD_PARAMETERS_SETS`), itself editable from
+Cumulocity (config type `parameters`). With it disabled, incoming operations are
+*rejected* with a reason rather than silently ignored. To add your own parameter
+set, drop an executable script into `/opt/tedge/parameter-plugins/` and list it
+in `MOD_PARAMETERS_SETS` — see [Pattern E in docs/EXTENSION-API.md](docs/EXTENSION-API.md).
+
+The wire contract is upstream's, unchanged: the same operation template, the
+same workflow, the same `prepare`/`set` protocol and the same plugin commands.
+Upstream's own paths work too — the dispatcher is also installed as
+`/usr/bin/parameter_update.sh` and plugins are found in
+`/usr/share/tedge/parameter-plugins/` as well as the module's own directory — so
+a plugin written against the upstream README runs here unmodified.
+
+[c8y-params]: https://cumulocity.com/docs/device-management-application/managing-device-parameters/
 
 ## Building
 
@@ -231,6 +340,8 @@ Over SSH (the app also symlinks `tedge` onto the system `PATH`):
 
 /opt/tedge/etc/init status      # daemon status
 /opt/tedge/etc/init restart     # apply settings changes
+/opt/tedge/etc/init reload metrics    # restart one feature only
+                                # (metrics|relay|container|parameters)
 tedge config list               # show effective configuration
 tedge cert show                 # show device certificate
 tail -f /var/log/tedge/*.log    # logs (mosquitto / mapper / agent)
@@ -241,7 +352,16 @@ tail -f /var/log/tedge/*.log    # logs (mosquitto / mapper / agent)
 Bump `TEDGE_VERSION` in `packages/tedge/Makefile`, update
 `packages/tedge/version.txt` and `modules/tedge/CHANGELOG.txt`, then rebuild.
 Config files are shipped as `*.default` and are **not** overwritten on reinstall,
-so operator settings survive upgrades. The device certificate/key also survive
+so operator settings survive upgrades. Beyond that, `bin/tedge-persist` carries
+the operator's own artifacts across the wipe an ICR-OS module upgrade performs —
+the cloud-editable feature configs (`etc/{metrics,relay,container,parameters}`),
+`etc/settings`, and **every flow the app does not ship** (a flow installed from
+Cumulocity's Software tab lives inside `/opt/tedge/mappers/` and was previously
+destroyed by an upgrade), plus any parameter plugin you added. They are saved to `/opt/tedge-data/persist` by
+`etc/uninstall` (which ICR-OS runs on an upgrade) and by `etc/init stop`, and
+restored by `etc/install`; where the new version ships a different config file,
+yours wins and the shipped one is kept alongside as `<file>.dist`. Inspect the
+store with `/opt/tedge/bin/tedge-persist status`. The device certificate/key also survive
 (see [Device identity, upgrades & removal](#device-identity-upgrades--removal)),
 so upgrading does not re-register the device in Cumulocity.
 

@@ -1,6 +1,152 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.0.16
+------
+* Device parameters: Cumulocity's c8y_ParameterUpdate feature is now supported,
+  ported from thin-edge.io's reference plugin tedge-parameter-plugin
+  (https://github.com/thin-edge/tedge-parameter-plugin) and adapted to this
+  Router App. An operator can change the router's own settings from Device
+  Management > Parameters through a typed form instead of pushing a whole
+  config file.
+    - Framework: operations/parameter_update.toml (the thin-edge workflow, so
+      tedge-agent publishes the parameter_update capability and the mapper
+      announces the operation) + operations/c8y/c8y_ParameterUpdate.template
+      (the mapper symlinks operations/c8y/c8y_ParameterUpdate to it once the
+      capability arrives) + bin/parameter-update (the dispatcher: finds the
+      c8y_ParameterUpdate_<Set> marker fragment and hands the payload to the
+      matching script in parameter-plugins/).
+    - Parameter sets: one per built-in feature, each reading/writing that
+      feature's own config file -- Metrics (etc/metrics: enabled, interval,
+      series, type), Relay (etc/relay: enabled, pollInterval, outputs,
+      activeLow) and Container (etc/container: enabled). After writing, the
+      plugin reloads only that feature and republishes the digital twin, so the
+      cloud reflects what actually landed on the device.
+    - flow_params: upstream's flows plugin, adapted. A FAMILY of sets -- one per
+      installed thin-edge flow that has a params.toml, named
+      flow_params_<mapper>_<flow> and discovered at runtime (no flows on the
+      router means no sets). Unlike upstream it edits keys IN PLACE instead of
+      regenerating params.toml from the payload, so the comments documenting a
+      flow's parameters survive a cloud update, and it needs no `sudo
+      tedge-write` (Router Apps run as root). A plugin serving a family lists
+      its types via a new `sets` command, which bin/parameter-seed expands.
+    - SCALAR parameter sets are supported: where Metrics/Relay/Container take a
+      field map, a Digital Twin Manager property whose schema is a plain
+      number/string sends a bare value, so the dispatcher passes non-object
+      payloads through untouched (as upstream's .operation[<Set>] already did)
+      and a plugin can accept either shape. docs/examples/relayAutoOffTime is a
+      worked example, deliberately NOT shipped: it binds one cloud parameter to
+      one flow setting, which makes it specific to a tenant's property and to a
+      flow this app does not ship. Copy it onto a router that has both; it is
+      then carried across upgrades like any operator-added plugin.
+    - bin/parameter-settoml: the TOML counterpart of bin/parameter-setconf --
+      one validated, comment-preserving writer for a flow's params.toml, shared
+      by flow_params and relayAutoOffTime. Enforces bare TOML keys and
+      JSON-serialized scalar/array values, and seeds a missing params.toml from
+      params.toml.template so a flow's documented defaults carry over.
+    - Payload shape is checked before parsing. tedge substitutes
+      ${.payload.parameters} as the RAW value, so a JSON string arrives as a
+      bare token (`soon`, not `"soon"`) that jq cannot parse -- under `set -e`
+      that aborted a plugin before it could report anything, and Cumulocity
+      showed a generic failure. Object sets now verify `type == "object"` first
+      and scalar extraction tolerates unparseable input, so the operator gets
+      e.g. "Metrics expects a JSON object of parameter values, got: garbage".
+      The dispatcher also falls back to the c8y_ParameterUpdate_<Set> marker
+      fragment when the values are not in a fragment named after the set.
+    - Failure reasons reach Cumulocity. A workflow file's on_error reason only
+      applies when a script cannot be LAUNCHED; for a script that runs and
+      fails, tedge-agent takes the reason from a {"reason": ...} object printed
+      between the :::begin-tedge::: markers. bin/parameter-update emits that
+      (reporting the last line of the plugin's stderr), so a rejected update
+      shows e.g. "MOD_METRICS_POLL_INTERVAL expects an integer, got 'soon'" on
+      the operation instead of "returned exit code 1".
+    - Values are written through bin/parameter-setconf, which VALIDATES every
+      value against its kind (bool/int/word) before it reaches a file that
+      etc/init sources as root -- a cloud-supplied value is never taken
+      verbatim. A full --check pass runs before the first write, so one invalid
+      field rejects the whole update instead of half-applying it. Fields the
+      cloud does not send are left untouched.
+    - bin/parameter-seed publishes every set's current values as retained twin
+      data at start (and on `etc/init reload parameters`), so the Parameters tab
+      shows the router's real state whether it was last changed from the cloud,
+      from configuration management or over SSH. Upstream delegates this to the
+      separate tedge-inventory service, which is not part of the thin-edge.io
+      standalone bundle; each plugin implements `get` instead, keeping the
+      config files the single source of truth.
+    - New etc/parameters config file (MOD_PARAMETERS_ENABLED, default 1, and
+      MOD_PARAMETERS_SETS), registered as the cloud-editable configuration type
+      "parameters". While disabled, an incoming operation is rejected with a
+      reason rather than silently ignored.
+    - etc/init gained `reload <metrics|relay|container|parameters>`, which
+      restarts a single built-in feature; a full restart re-runs tedge connect
+      and takes ~30 s. Used by the parameter plugins and handy over SSH.
+    - Adding a parameter set is a file drop into parameter-plugins/ plus a name
+      in MOD_PARAMETERS_SETS -- documented as Pattern E in
+      docs/EXTENSION-API.md. The upstream convention that one plugin may serve a
+      family of types (flow_params_*) is preserved by the dispatcher.
+    - Upstream compatibility is explicit: the operation template is byte-identical
+      to upstream's, the workflow differs only in the script path, and the
+      prepare/set protocol and plugin commands are unchanged. etc/install also
+      exposes the dispatcher under upstream's name (/usr/bin/parameter_update.sh)
+      and the dispatcher + parameter-seed search upstream's plugin directory
+      (/usr/share/tedge/parameter-plugins) in addition to the module's own, so a
+      plugin written against the upstream README drops in unmodified. Verified on
+      device with an upstream-shaped plugin in upstream's directory.
+    - Tenant setup: the device declares NOTHING per parameter -- only that it
+      supports c8y_ParameterUpdate, plus the value as a twin fragment. The
+      Parameters tab renders from the tenant's Digital Twin Manager Property
+      Library, so a set stays invisible until a definition with the same
+      identifier exists there, and its "contexts" decide the behaviour:
+      asset+event shows the value read-only, asset+event+operation makes it
+      editable, asset alone shows nothing. Also needs the dtm and
+      device-parameter microservices. scripts/c8y-parameter-definitions.sh
+      creates/deletes/lists the definitions via go-c8y-cli (an admin session: a
+      device user is refused with ROLE_DIGITAL_TWIN_DEFINITIONS_CREATE).
+    - Verified end to end on an ICR-4401W1S against a live Cumulocity tenant:
+      the announcement path (the mapper creates operations/c8y/c8y_ParameterUpdate
+      from the .template once tedge-agent publishes the capability), seeding,
+      updates to all four sets with only the affected feature restarted, and
+      every rejection path (invalid type, shell metacharacters, mixed
+      valid/invalid payload, unknown set, missing marker fragment, feature
+      disabled, TOML key injection, unknown flow). See
+      docs/ON-DEVICE-VALIDATION-PARAMETERS.md for the record and what is still
+      open (reboot, the v2i/v3 platforms, the Parameters tab rendering).
+* Upgrades no longer destroy the operator's own artifacts. ICR-OS replaces
+  /opt/<module> wholesale, so everything added INSIDE the module tree was lost on
+  every update -- most importantly any flow installed from Cumulocity's Software
+  tab (the flows plugin unpacks them into mappers/<mapper>/flows/), and the
+  cloud-editable feature configs, which silently reverted to the shipped
+  defaults (e.g. relay polarity back to active-low). New bin/tedge-persist saves
+  them, together with any parameter plugin the operator dropped into
+  parameter-plugins/, to /opt/tedge-data/persist -- the same partition and
+  self-cleaning guard as the device certificate -- from etc/uninstall (which ICR-OS also runs on an
+  upgrade, right before the tree is replaced) and from etc/init stop; etc/install
+  restores them into the new tree. Shipped flows are excluded via a manifest
+  (mappers/.shipped-flows, and parameter-plugins/.shipped for the plugins)
+  written at install time, so the new version's own copies always win. Only flow
+  DIRECTORIES are carried: the flows plugin installs each flow as a directory,
+  while the mapper's built-in flows are flat *.toml files it regenerates at
+  runtime and which are not in the package at all -- so the flow manifest is
+  legitimately empty on a fresh install and must not be the only filter; a restored config file wins over the shipped one, which is
+  kept alongside as <file>.dist so new settings stay discoverable. Inspect with
+  `tedge-persist status`. Rehearsed on device: flow restored with its comments,
+  MOD_RELAY_ACTIVE_LOW preserved across a simulated wipe.
+* Fixed: the c8y-ca one-time-password fallback produced an EMPTY password on
+  firmware without md5sum. etc/init documented "leave MOD_TEDGE_OTP empty to
+  derive md5 of the device id", but this ICR-OS busybox has no md5sum (nor
+  sha*sum or cksum), so the fallback silently yielded nothing and registration
+  failed with no explanation. It now checks for the tool and, when absent, logs
+  that MOD_TEDGE_OTP must be set explicitly.
+* New package packages/jq: the parameter dispatcher has to parse cloud-supplied
+  JSON, and ICR-OS busybox provides no JSON tooling. The statically linked jq
+  1.8.2 binary for the target architecture (armel/armhf/arm64, ~1.8 MB) is
+  fetched at build time and laid at bin/jq, which is on the PATH set by
+  /opt/tedge/env and by the S99 service scripts -- so `jq` resolves for the
+  workflow scripts, the parameter plugins and over SSH. Note: the ICR-OS
+  firmware on the test router does ship jq 1.8.1 at /usr/bin/jq; the scripts
+  prefer the bundled copy (absolute path, known version) and fall back to PATH,
+  so this package can be dropped if every target firmware is known to have it.
+
 1.0.15
 ------
 * Container management: the tedge-container-plugin (upstream "ng" build, pinned

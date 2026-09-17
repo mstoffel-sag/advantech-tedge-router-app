@@ -1,0 +1,50 @@
+# thin-edge.io operation workflow: parameter_update
+#
+# Implements the Cumulocity "device parameters" feature
+# (https://cumulocity.com/docs/device-management-application/managing-device-parameters/)
+# on the router. Ported from thin-edge.io's reference plugin
+# https://github.com/thin-edge/tedge-parameter-plugin -- adapted to this Router
+# App: the scripts live in /opt/tedge/bin (not /usr/bin) and the parameter-set
+# plugins in /opt/tedge/parameter-plugins (not /usr/share/tedge).
+#
+# tedge-agent loads every *.toml in /opt/tedge/operations as a workflow and, on
+# start, publishes the matching capability message
+#     te/device/main///cmd/parameter_update {}
+# which makes the c8y mapper symlink operations/c8y/c8y_ParameterUpdate to the
+# .template file and announce the operation to Cumulocity (SmartREST 114).
+#
+# Flow: Cumulocity sends c8y_ParameterUpdate with a c8y_ParameterUpdate_<Type>
+# marker fragment and a <Type> payload fragment; `prepare` picks the type out of
+# the operation, `run` hands the payload to the matching parameter plugin.
+
+operation = "parameter_update"
+
+[init]
+  action = "proceed"
+  on_success = "executing"
+
+[executing]
+  action = "proceed"
+  on_success = "prepare"
+
+# The on_error reasons below are only a fallback for a script that cannot be
+# LAUNCHED (missing/not executable). When the script runs and exits non-zero,
+# tedge-agent takes the reason from the {"reason": ...} object the script prints
+# between the markers -- which is how the real cause (e.g. a rejected value)
+# reaches the Cumulocity operation instead of "returned exit code 1".
+
+[prepare]
+  script = "/opt/tedge/bin/parameter-update prepare ${.payload}"
+  on_success = "run"
+  on_error = { status = "failed", reason = "cannot run /opt/tedge/bin/parameter-update" }
+
+[run]
+  script = "/opt/tedge/bin/parameter-update set ${.payload.type} ${.payload.parameters}"
+  on_success = "successful"
+  on_error = { status = "failed", reason = "cannot run /opt/tedge/bin/parameter-update" }
+
+[successful]
+  action = "cleanup"
+
+[failed]
+  action = "cleanup"

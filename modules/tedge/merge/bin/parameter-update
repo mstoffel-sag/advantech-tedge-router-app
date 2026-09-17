@@ -1,0 +1,159 @@
+#!/bin/sh
+# parameter-update -- dispatcher for the Cumulocity device-parameter feature
+# (c8y_ParameterUpdate), driven by the operations/parameter_update.toml workflow.
+#
+# Ported from thin-edge.io's reference plugin (src/parameter_update.sh in
+# https://github.com/thin-edge/tedge-parameter-plugin), adapted to this Router
+# App: plugins live in /opt/tedge/parameter-plugins, jq is the bundled
+# /opt/tedge/bin/jq, and the feature is gated by /opt/tedge/etc/parameters.
+#
+# Called by tedge-agent in two steps:
+#
+#   parameter-update prepare '<operation json>'
+#       Finds the c8y_ParameterUpdate_<Type> marker fragment, and emits
+#       {"type":"<Type>","parameters":{...}} back into the workflow state
+#       (between the :::begin-tedge::: / :::end-tedge::: markers).
+#
+#   parameter-update set <Type> '<parameters json>'
+#       Runs parameter-plugins/<Type> with the new values.
+#
+# Everything human-readable goes to stderr: stdout is the workflow channel (only
+# the marked excerpt is decoded, but keeping stdout clean avoids surprises -- see
+# the c8y_Relay stdout lesson in docs/ON-DEVICE-VALIDATION.md).
+#
+# On failure the cause is ALSO written to stdout as {"reason": "..."} inside the
+# markers. tedge-agent reads that reason for a failing script and puts it on the
+# operation, so Cumulocity shows e.g. "MOD_METRICS_POLL_INTERVAL expects an
+# integer, got 'soon'" instead of the useless default "returned exit code 1"
+# (verified on device; see docs/ON-DEVICE-VALIDATION-PARAMETERS.md).
+set -e
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+PARAMETER_PLUGINS="$MOD_DIR/parameter-plugins"
+# Upstream installs parameter plugins in /usr/share/tedge/parameter-plugins and
+# its documentation tells people to put theirs there. Router Apps live under
+# /opt/<module>, so ours ship in the module tree -- but both directories are
+# searched, so a community plugin can be dropped in where its README says.
+UPSTREAM_PLUGINS=/usr/share/tedge/parameter-plugins
+SETTINGS="${MOD_PARAMETERS_SETTINGS:-$MOD_DIR/etc/parameters}"
+
+# The bundled jq (packages/jq). Prefer the absolute path: the workflow script is
+# launched by tedge-agent, whose PATH we do not otherwise control.
+JQ=$MOD_DIR/bin/jq
+[ -x "$JQ" ] || JQ=jq
+
+# fail <message> -- report the cause to the operator and abort.
+# The message is echoed to stderr (workflow transcript) and emitted as the
+# workflow state's `reason` (Cumulocity operation). jq does the JSON quoting, so
+# a value echoed back from the cloud cannot break the payload.
+fail() {
+    echo "$1" >&2
+    r=$(printf '%s' "$1" | "$JQ" -Rs 'gsub("[\n\r]";" ")' 2>/dev/null)
+    if [ -n "$r" ]; then
+        echo :::begin-tedge:::
+        printf '{"reason":%s}\n' "$r"
+        echo :::end-tedge:::
+    fi
+    exit 1
+}
+
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+# Feature gate. Disabling parameters must also refuse cloud writes, not just
+# hide the values -- so fail the operation with a clear reason.
+enabled=1
+[ -f "$SETTINGS" ] && enabled=$(. "$SETTINGS"; echo "${MOD_PARAMETERS_ENABLED:-1}")
+if [ "$enabled" != "1" ]; then
+    fail "device parameters are disabled on this device (MOD_PARAMETERS_ENABLED=0)"
+fi
+
+# The parameter type is cloud-supplied and is used to build a file path, so it
+# is validated before it ever reaches the filesystem (no slashes, no "..").
+valid_type() {
+    case "$1" in
+        ""|*[!A-Za-z0-9_-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+get_parameter_type() {
+    echo "$1" | "$JQ" -r '.operation | keys | .[]
+        | select(. | startswith("c8y_ParameterUpdate_"))
+        | sub("^c8y_ParameterUpdate_"; "")'
+}
+
+set_parameters() {
+    if [ $# -lt 2 ]; then
+        fail "missing arguments: expected a parameter type and a JSON payload"
+    fi
+    TYPE="$1"
+    PARAMETERS="$2"
+
+    valid_type "$TYPE" || fail "invalid parameter type: '$TYPE'"
+
+    case "$TYPE" in
+        flow_params_*)
+            # Upstream convention: one plugin may serve a whole family of types
+            # (the flows plugin manages every flow's params.toml). Keep it so a
+            # dropped-in upstream plugin behaves the same here.
+            COMMON_TYPE=flow_params
+            ;;
+        *)
+            COMMON_TYPE="$TYPE"
+            ;;
+    esac
+
+    plugin=""
+    for dir in "$PARAMETER_PLUGINS" "$UPSTREAM_PLUGINS"; do
+        if [ -x "$dir/$COMMON_TYPE" ]; then plugin="$dir/$COMMON_TYPE"; break; fi
+    done
+    if [ -z "$plugin" ]; then
+        fail "no parameter plugin for '$TYPE' on this device ($PARAMETER_PLUGINS/$COMMON_TYPE)"
+    fi
+
+    echo "Running parameter plugin: $plugin set <parameters> $TYPE" >&2
+    # Capture the plugin's stderr so its last line (usually the validation
+    # message from parameter-setconf) can be reported as the failure reason,
+    # while still echoing everything into the workflow transcript. The plugin's
+    # own stdout goes to stderr -- stdout here is the workflow channel.
+    err=/tmp/parameter-update.$$.err
+    if "$plugin" set "$PARAMETERS" "$TYPE" >&2 2>"$err"; then
+        cat "$err" >&2
+        rm -f "$err"
+    else
+        cat "$err" >&2
+        reason=$(awk 'NF { last = $0 } END { print last }' "$err")
+        rm -f "$err"
+        fail "${reason:-parameter plugin '$TYPE' failed}"
+    fi
+}
+
+case "$COMMAND" in
+    prepare)
+        MESSAGE="${1:-}"
+        TYPE=$(get_parameter_type "$MESSAGE")
+        if [ -z "$TYPE" ]; then
+            fail "no c8y_ParameterUpdate_<Set> fragment in the operation: cannot tell which parameter set to update"
+        fi
+        valid_type "$TYPE" || fail "invalid parameter type: '$TYPE'"
+
+        # Upstream's expression, with `// {}` so an absent fragment yields an
+        # empty object rather than `null`. Whatever shape the fragment has is
+        # passed through untouched -- an object for a field-map set, a bare
+        # value for a scalar one -- and the plugin decides what it accepts.
+        PARAMETER_PAYLOAD=$(echo "$MESSAGE" | "$JQ" -c --arg t "$TYPE" '.operation[$t] // {}')
+
+        echo :::begin-tedge:::
+        printf '{"type":"%s","parameters":%s}\n' "$TYPE" "$PARAMETER_PAYLOAD"
+        echo :::end-tedge:::
+        ;;
+    set)
+        set_parameters "$@"
+        ;;
+    *)
+        echo "usage: parameter-update {prepare <operation-json>|set <type> <parameters-json>}" >&2
+        exit 2
+        ;;
+esac

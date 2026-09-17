@@ -2,6 +2,13 @@
 # Executed by ICR-OS when the Router App is removed.
 MOD_DIR=/opt/tedge
 
+# Save the operator's own artifacts FIRST. ICR-OS runs this script on an upgrade
+# as well, immediately before /opt/tedge is replaced -- so this is the last
+# moment at which flows installed from the cloud and the cloud-editable feature
+# configs still exist. etc/install restores them into the new tree. See
+# bin/tedge-persist.
+[ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" save 2>/dev/null
+
 # Stop thin-edge.io if it is still running.
 [ -x "$MOD_DIR/etc/init" ] && "$MOD_DIR/etc/init" stop 2>/dev/null
 
@@ -19,6 +26,14 @@ fi
 # and force a Cumulocity re-registration every time. On a genuine DELETE the
 # store is instead removed by its own self-cleaning guard (/opt/tedge-data/etc/init,
 # written by etc/install) on the first boot after /opt/tedge is gone.
+
+# Remove the upstream-compatibility symlink for the parameter dispatcher (only
+# if it points at our script).
+if [ -h /usr/bin/parameter_update.sh ]; then
+    case "$(readlink /usr/bin/parameter_update.sh 2>/dev/null)" in
+        "$MOD_DIR"/*) rm -f /usr/bin/parameter_update.sh ;;
+    esac
+fi
 
 # Remove the /etc/tedge -> /opt/tedge config-dir symlink (only if it is ours).
 if [ -L /etc/tedge ]; then
