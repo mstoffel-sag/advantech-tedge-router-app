@@ -1,0 +1,18 @@
+# Cumulocity operation template: c8y_ParameterUpdate -> parameter_update workflow
+#
+# A `.template` file is not announced on its own. When the device publishes the
+# capability te/device/main///cmd/parameter_update (tedge-agent does this for
+# the operations/parameter_update.toml workflow), the c8y mapper symlinks
+# operations/c8y/c8y_ParameterUpdate to this file and announces the operation.
+#
+# Custom operations on this thin-edge.io build are dispatched ONLY through the
+# JSON devicecontrol/notifications channel -- on_message/"c8y/s/ds" (SmartREST)
+# is not routed to custom handlers. See docs/ON-DEVICE-VALIDATION.md.
+
+[exec]
+topic = "c8y/devicecontrol/notifications"
+on_fragment = "c8y_ParameterUpdate"
+
+[exec.workflow]
+operation = "parameter_update"
+input.operation = "${.payload}"

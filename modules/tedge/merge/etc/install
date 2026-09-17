@@ -119,6 +119,36 @@ if [ -x "$MOD_DIR/bin/tedge-config-register" ] && [ -f "$MOD_DIR/etc/relay" ]; t
 fi
 
 # ---------------------------------------------------------------------------
+# Device parameters (c8y_ParameterUpdate), ported from thin-edge.io's
+# tedge-parameter-plugin.
+#
+# The workflow (operations/parameter_update.toml) and the Cumulocity operation
+# template (operations/c8y/c8y_ParameterUpdate.template) ship natively in this
+# platform dir, so nothing has to be symlinked: tedge-agent loads the workflow
+# and publishes the te/device/main///cmd/parameter_update capability, whereupon
+# the mapper links operations/c8y/c8y_ParameterUpdate to the template and
+# announces the operation. Here we only make the parameter-set plugins
+# executable and register the feature's own config file. Adding a parameter set
+# is a file drop into parameter-plugins/ (docs/EXTENSION-API.md, Pattern E).
+# ---------------------------------------------------------------------------
+chmod +x "$MOD_DIR/parameter-plugins/"* 2>/dev/null || true
+
+# Upstream compatibility: its package installs the dispatcher at
+# /usr/bin/parameter_update.sh and its plugins in /usr/share/tedge/parameter-
+# plugins, and community plugins / docs reference those paths. Provide the
+# script under its upstream name and create the upstream plugin directory, so a
+# plugin written against upstream drops in unchanged (bin/parameter-update
+# searches both directories).
+[ -d "$PREFIX/usr/bin" ] || mkdir -p "$PREFIX/usr/bin"
+[ -e "$PREFIX/usr/bin/parameter_update.sh" ] \
+    || ln -sf "$MOD_DIR/bin/parameter-update" "$PREFIX/usr/bin/parameter_update.sh"
+mkdir -p "$PREFIX/usr/share/tedge/parameter-plugins" 2>/dev/null || true
+
+if [ -x "$MOD_DIR/bin/tedge-config-register" ] && [ -f "$MOD_DIR/etc/parameters" ]; then
+    "$MOD_DIR/bin/tedge-config-register" add parameters "$MOD_DIR/etc/parameters" parameters || true
+fi
+
+# ---------------------------------------------------------------------------
 # Container plugin (tedge-container-plugin, folded into this platform module).
 #
 # The plugin is a single multi-call binary at bin/tedge-container. It selects

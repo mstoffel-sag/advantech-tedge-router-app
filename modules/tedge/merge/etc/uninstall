@@ -20,6 +20,14 @@ fi
 # store is instead removed by its own self-cleaning guard (/opt/tedge-data/etc/init,
 # written by etc/install) on the first boot after /opt/tedge is gone.
 
+# Remove the upstream-compatibility symlink for the parameter dispatcher (only
+# if it points at our script).
+if [ -h /usr/bin/parameter_update.sh ]; then
+    case "$(readlink /usr/bin/parameter_update.sh 2>/dev/null)" in
+        "$MOD_DIR"/*) rm -f /usr/bin/parameter_update.sh ;;
+    esac
+fi
+
 # Remove the /etc/tedge -> /opt/tedge config-dir symlink (only if it is ours).
 if [ -L /etc/tedge ]; then
     case "$(readlink /etc/tedge 2>/dev/null)" in

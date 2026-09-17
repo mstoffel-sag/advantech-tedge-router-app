@@ -1,0 +1,137 @@
+#!/bin/sh
+# Parameter plugin: flow_params (a FAMILY of parameter sets)
+#
+# Exposes the `params.toml` of every thin-edge.io *flow* installed on this
+# router as a Cumulocity parameter set, so a flow's tunables can be changed from
+# Device Management > Parameters. Ported from upstream's flows plugin
+# (https://github.com/thin-edge/tedge-parameter-plugin, src/plugins/flow_params)
+# and adapted: no `sudo tedge-write` (Router Apps run as root), keys are edited
+# IN PLACE via bin/parameter-settoml instead of regenerating the file (upstream
+# rewrites it from the JSON, which drops the comments that document a flow's
+# parameters -- and params.toml is where a flow explains itself), and the set
+# list is enumerated here rather than by the separate tedge-inventory service.
+#
+# One plugin serves many sets, named by upstream's convention:
+#     flow_params_<mapper>_<flow>      e.g. flow_params_c8y_relay-auto-open
+# bin/parameter-update maps every flow_params_* type back to this script.
+#
+#   flow_params sets              -- list the sets that exist on this router
+#   flow_params get <type>        -- that flow's current params as JSON
+#   flow_params set <json> <type> -- merge into the flow's params.toml, publish twin
+#
+# Note: params.toml is parsed as TOML by the flows mapper -- it is NOT sourced by
+# a shell -- so the shell-metacharacter rules of bin/parameter-setconf do not
+# apply here. bin/parameter-settoml enforces what does matter: bare TOML keys
+# (a key may not smuggle in extra lines) and JSON-serialized values, so a string
+# value cannot break out of its line. The flow directory must already exist.
+set -e
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+MAPPERS="$MOD_DIR/mappers"
+TYPE_PREFIX=flow_params_
+
+JQ=$MOD_DIR/bin/jq
+[ -x "$JQ" ] || JQ=jq
+SETTOML="$MOD_DIR/bin/parameter-settoml"
+
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+# flow_dir <type> -- the flow directory a flow_params_<mapper>_<flow> type names.
+flow_dir() {
+    t=${1#$TYPE_PREFIX}
+    mapper=$(echo "$t" | cut -d_ -f1)
+    name=$(echo "$t" | cut -d_ -f2-)
+    [ -n "$mapper" ] && [ -n "$name" ] || return 1
+    echo "$MAPPERS/$mapper/flows/$name"
+}
+
+# params_file <dir> -- the live params.toml, falling back to the shipped
+# template while the flow has not been customised yet.
+params_file() {
+    if [ -f "$1/params.toml" ]; then echo "$1/params.toml"
+    elif [ -f "$1/params.toml.template" ]; then echo "$1/params.toml.template"
+    else return 1
+    fi
+}
+
+# read_params <file> -- TOML key/value lines -> a JSON object. Lines that are
+# not a scalar assignment (comments, blanks, tables, multi-line values) are
+# skipped rather than failing the whole read.
+read_params() {
+    "$JQ" -c --raw-input --null-input '[ inputs
+        | gsub("\r$"; "")
+        | select(length > 0 and (startswith("#") | not))
+        | capture("^\\s*(?<k>[A-Za-z0-9_.-]+)\\s*=\\s*(?<v>.+?)\\s*$")
+        | . as $m
+        | try { ($m.k): ($m.v | fromjson) } catch empty
+      ] | add // {}' "$1"
+}
+
+sets() {
+    for d in "$MAPPERS"/*/flows/*; do
+        [ -d "$d" ] || continue
+        params_file "$d" >/dev/null 2>&1 || continue
+        name=$(basename "$d")
+        mapper=$(basename "$(dirname "$(dirname "$d")")")
+        t="$TYPE_PREFIX${mapper}_${name}"
+        # Only advertise sets whose name survives the dispatcher's type check.
+        case "$t" in
+            *[!A-Za-z0-9_-]*) continue ;;
+        esac
+        echo "$t"
+    done
+}
+
+get() {
+    t="${1:?parameter type required}"
+    dir=$(flow_dir "$t") || return 1
+    f=$(params_file "$dir") || return 1
+    read_params "$f"
+}
+
+update() {
+    MESSAGE="$1"
+    t="${2:?parameter type required}"
+
+    dir=$(flow_dir "$t") || { echo "malformed flow parameter type: '$t'" >&2; exit 1; }
+    if [ ! -d "$dir" ]; then
+        echo "no such flow on this device: $dir" >&2
+        exit 1
+    fi
+
+    pairs=$(echo "$MESSAGE" | "$JQ" -r 'to_entries[] | "\(.key) \(.value|tojson)"')
+    if [ -z "$pairs" ]; then
+        echo "no parameters given for $t" >&2
+        exit 1
+    fi
+
+    # Validate every key/value first, then write: one bad field must reject the
+    # whole update rather than leave the flow half-configured. parameter-settoml
+    # keeps the file's comments (params.toml is where a flow documents itself)
+    # and seeds it from params.toml.template on first use.
+    echo "$pairs" > "/tmp/flow-params.$$"
+    for mode in --check --write; do
+        while read -r k v; do
+            [ -n "$k" ] || continue
+            "$SETTOML" "$mode" "$dir/params.toml" "$k" "$v" || {
+                rm -f "/tmp/flow-params.$$"; exit 1; }
+        done < "/tmp/flow-params.$$"
+    done
+    rm -f "/tmp/flow-params.$$"
+    echo "Updated $dir/params.toml" >&2
+
+    # The flows mapper reloads on any change in the flow directory (verified on
+    # device), so nothing is restarted here -- restarting the mapper would drop
+    # the cloud connection for every other feature.
+    tedge mqtt pub -r "te/device/main///twin/$t" "$(get "$t")"
+}
+
+case "$COMMAND" in
+    sets) sets ;;
+    get)  get "${1:-}" ;;
+    set)  update "${1:?parameters required}" "${2:?parameter type required}" ;;
+    init) for t in $(sets); do tedge mqtt pub -r "te/device/main///twin/$t" "$(get "$t")"; done ;;
+    *) echo "usage: flow_params {sets|get <type>|set <json> <type>|init}" >&2; exit 1 ;;
+esac

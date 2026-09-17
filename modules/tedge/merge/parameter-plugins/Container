@@ -1,0 +1,93 @@
+#!/bin/sh
+# Parameter plugin: Container
+#
+# Exposes the container monitoring daemon (`tedge-container run`, gated by
+# etc/container) as a Cumulocity parameter set.
+#
+#   Container get               -- print the current values as JSON (twin payload)
+#   Container set <json> <type>  -- apply new values, reload the daemon, publish twin
+#
+# Only the daemon is gated here; the container / container-group
+# software-management plugins are always available. The daemon additionally
+# requires the Advantech Docker Router App to be installed -- enabling it on a
+# router without one is a no-op that etc/init logs. Detailed plugin behaviour
+# lives in plugins/tedge-container-plugin.toml (cloud-editable config type).
+set -e
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+CONF=$MOD_DIR/etc/container
+TYPE=Container
+FEATURE=container
+TOPIC="te/device/main///twin/$TYPE"
+
+JQ=$MOD_DIR/bin/jq
+[ -x "$JQ" ] || JQ=jq
+SETCONF="$MOD_DIR/bin/parameter-setconf"
+
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+jbool() { [ "$1" = "1" ] && echo true || echo false; }
+
+get() {
+    # Subshell: never leak the sourced MOD_* into the caller's environment.
+    (
+        [ -f "$CONF" ] && . "$CONF"
+        printf '{"enabled":%s}\n' "$(jbool "${MOD_CONTAINER_ENABLED:-1}")"
+    )
+}
+
+# field <name> -- the value from the operation payload, empty when not supplied.
+# `has()` rather than `//` so that an explicit `false` is not read as "absent".
+field() { echo "$MESSAGE" | "$JQ" -r --arg k "$1" 'if has($k) then .[$k] else empty end'; }
+
+# maybe <mode> <KEY> <kind> <field> -- apply one field if the cloud supplied it.
+# An `if` block, not `[ ... ] &&`: a trailing false test would make the function
+# return non-zero and abort the script under `set -e`.
+maybe() {
+    val=$(field "$4")
+    if [ -n "$val" ]; then
+        "$SETCONF" "$1" "$CONF" "$2" "$3" "$val"
+    fi
+}
+
+# apply <--check|--write> -- validate (and optionally write) every field.
+apply() {
+    maybe "$1" MOD_CONTAINER_ENABLED      bool enabled
+}
+
+update() {
+    MESSAGE="$1"
+
+    # This set is a field map, so the payload must be a JSON object. It is not
+    # always one: tedge substitutes ${.payload.parameters} as the raw value, so
+    # a malformed or scalar payload arrives as a bare word that jq cannot parse
+    # -- checking here reports that plainly instead of failing on the first
+    # field() with no message at all.
+    if ! echo "$MESSAGE" | "$JQ" -e 'type == "object"' >/dev/null 2>&1; then
+        echo "$TYPE expects a JSON object of parameter values, got: $MESSAGE" >&2
+        exit 1
+    fi
+
+    # Validate everything first: a single bad value must reject the whole
+    # update rather than leave the config half-applied.
+    apply --check
+    apply --write
+
+    # Restart just this feature (not the whole module: a full restart re-runs
+    # tedge connect and takes ~30 s).
+    "$MOD_DIR/etc/init" reload "$FEATURE" >&2
+
+    # Reflect the applied state. Normally the Device Parameter microservice
+    # updates the digital twin; publishing it here keeps the cloud in sync with
+    # what actually landed in the config file.
+    tedge mqtt pub -r "$TOPIC" "$(get)"
+}
+
+case "$COMMAND" in
+    get)  get ;;
+    set)  update "${1:?parameters required}" ;;
+    init) tedge mqtt pub -r "$TOPIC" "$(get)" ;;
+    *) echo "usage: $TYPE {get|set <json>|init}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,65 @@
+#!/bin/sh
+# parameter-settoml -- set one key in a flow's params.toml (or any simple TOML
+# key/value file), in place.
+#
+#   parameter-settoml [--check|--write] <file> <key> <json-value>
+#
+# Sibling of bin/parameter-setconf (which handles the module's shell config
+# files). Two reasons it exists separately:
+#   * params.toml is read as TOML by the flows mapper -- it is NOT sourced by a
+#     shell -- so the value rules differ: the value must be valid JSON (jq
+#     `tojson` output), which is also valid TOML for scalars and arrays.
+#   * the key must be a bare TOML key. A key carrying whitespace or a newline
+#     could otherwise smuggle extra lines into the file.
+#
+# The key is rewritten in place, keeping the file's comments, ordering and
+# unrelated keys; it is appended if absent. A missing file is seeded from
+# <file>.template when there is one, so a flow's documented defaults (and their
+# comments) are carried over on first use.
+#
+# --check validates and writes nothing; --write (the default) applies the change.
+set -u
+
+MODE=--write
+case "${1-}" in
+    --check|--write) MODE="$1"; shift ;;
+esac
+
+FILE="${1:?toml file required}"
+KEY="${2:?key required}"
+VALUE="${3-}"
+
+case "$KEY" in
+    ""|*[!A-Za-z0-9_.-]*) echo "parameter-settoml: unsupported TOML key: '$KEY'" >&2; exit 1 ;;
+esac
+
+# The value must be a JSON scalar or array -- never a bare word, never an object
+# (a TOML inline table would need different syntax) and never multi-line.
+case "$VALUE" in
+    ""|*[!\ -~]*) echo "parameter-settoml: $KEY has an empty or non-printable value" >&2; exit 1 ;;
+    \{*) echo "parameter-settoml: $KEY: nested objects are not supported in params.toml" >&2; exit 1 ;;
+esac
+JQ=/opt/tedge/bin/jq
+[ -x "$JQ" ] || JQ=jq
+if ! printf '%s' "$VALUE" | "$JQ" -e 'type | . == "number" or . == "string" or . == "boolean" or . == "array"' >/dev/null 2>&1; then
+    echo "parameter-settoml: $KEY: value is not a JSON scalar or array: $VALUE" >&2
+    exit 1
+fi
+
+[ "$MODE" = "--check" ] && exit 0
+
+if [ ! -f "$FILE" ]; then
+    if [ -f "$FILE.template" ]; then
+        cp "$FILE.template" "$FILE"
+    else
+        : > "$FILE"
+    fi
+fi
+
+TMP="$FILE.tmp.$$"
+awk -v k="$KEY" -v v="$VALUE" '
+    $0 ~ "^[[:space:]]*"k"[[:space:]]*=" { if (!done) { print k " = " v; done=1 }; next }
+    { print }
+    END { if (!done) print k " = " v }
+' "$FILE" > "$TMP" || { rm -f "$TMP"; exit 1; }
+mv "$TMP" "$FILE"

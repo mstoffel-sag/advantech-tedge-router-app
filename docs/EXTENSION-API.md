@@ -39,7 +39,15 @@ integration surface is:
    which **appends/removes only its own `[[files]]` block**, so an extension can
    make its log files retrievable from Cumulocity's Logs tab (the
    `c8y_LogfileRequest` operation).
-6. **Contract version** — `/opt/tedge/etc/contract-version` (integer). Bump it
+6. **The parameter registry** — the platform implements Cumulocity's
+   device-parameter operation (`c8y_ParameterUpdate`) and dispatches each
+   parameter set to an executable of that name in
+   `/opt/tedge/parameter-plugins/`. Dropping a script there (and adding its name
+   to `MOD_PARAMETERS_SETS` in `/opt/tedge/etc/parameters`) is all it takes to
+   get a typed form in the cloud for an extension's settings. The platform also
+   ships `/opt/tedge/bin/parameter-setconf` for writing validated values into a
+   shell config file, and `/opt/tedge/bin/jq`.
+7. **Contract version** — `/opt/tedge/etc/contract-version` (integer). Bump it
    only on a breaking change to any of the above. Extensions may read it in
    their `install` hook and refuse to install against an incompatible platform.
 
@@ -120,6 +128,172 @@ preserved. Logs are uploaded on demand — do **not** register files that contai
 secrets. No `service` argument and no reload step: the plugin reads the file at
 request time.
 
+### Pattern E — cloud-managed parameters
+
+Pattern C hands the operator a whole config *file*. Cumulocity's
+[device-parameter feature][c8y-params] instead renders a **typed form** (Device
+Management > Parameters) from a JSON schema and sends only the changed values as
+a `c8y_ParameterUpdate` operation. The platform owns the operation, the workflow
+and the dispatcher; an extension only supplies one script per parameter set.
+
+#### Adding a parameter, step by step
+
+Compared with standard thin-edge (upstream's `tedge-parameter-plugin`), this is
+one file and one line instead of two files in two locations plus a manual
+publish:
+
+| | upstream | here |
+|--|--|--|
+| 1 | write the plugin into `/usr/share/tedge/parameter-plugins/<Set>` | write the plugin into `/opt/tedge/parameter-plugins/<Set>` (upstream's path also works) |
+| 2 | write a **second** script, `/usr/share/tedge-inventory/scripts.d/NN_<Set>` (needs the separate `tedge-inventory` package), or publish the initial value by hand with `tedge mqtt pub -r` | implement `get` in the same plugin and add `<Set>` to `MOD_PARAMETERS_SETS` in `/opt/tedge/etc/parameters` |
+| 3 | create the Digital Twin Manager property definition | **same** — `scripts/c8y-parameter-definitions.sh` |
+| 4 | — | `/opt/tedge/etc/init reload parameters` to publish it now (boot does it anyway) |
+
+The trade is row 2. Upstream defines `get` but never calls it — its own example
+carries the comment *"TODO: Does it make sense to have an init command, and a
+get?"*. Here `get` is load-bearing, which is what removes the second file: the
+platform re-reads the real values at every boot instead of remembering a value
+published once.
+
+A minimal plugin:
+
+```sh
+#!/bin/sh
+set -e
+COMMAND="$1"; shift
+CONF=/opt/tedge/etc/mything
+JQ=/opt/tedge/bin/jq
+
+get() { . "$CONF"; printf '{"threshold":%s}\n' "${MOD_MYTHING_THRESHOLD:-10}"; }
+
+case "$COMMAND" in
+  get) get ;;
+  set) v=$(echo "$1" | "$JQ" -r 'if has("threshold") then .threshold else empty end')
+       [ -n "$v" ] && /opt/tedge/bin/parameter-setconf "$CONF" MOD_MYTHING_THRESHOLD int "$v"
+       tedge mqtt pub -r te/device/main///twin/MyThing "$(get)" ;;
+esac
+```
+
+Test it without the cloud:
+
+```sh
+/opt/tedge/parameter-plugins/MyThing get
+/opt/tedge/bin/parameter-update set MyThing '{"threshold":42}'   # full dispatch path
+```
+
+> A plugin dropped into `/opt/tedge` is **wiped by a module upgrade** (ICR-OS
+> replaces the module tree). For a throwaway that is fine; anything permanent
+> belongs in the repo at `modules/tedge/merge/parameter-plugins/<Set>`, with its
+> name in the shipped `merge/etc/parameters`, so it is part of the app.
+
+#### The plugin contract
+
+A parameter plugin is an executable named exactly after its parameter set,
+implementing the commands below. Two directories are searched, so a plugin
+written against upstream's documentation drops in unchanged:
+
+| Directory | |
+|--|--|
+| `/opt/tedge/parameter-plugins/` | the platform's own, and where an extension should install from its `install` hook |
+| `/usr/share/tedge/parameter-plugins/` | upstream `tedge-parameter-plugin`'s location |
+
+The dispatcher is also reachable under upstream's name,
+`/usr/bin/parameter_update.sh`. The commands:
+
+```sh
+<Set> get [<type>]        # print the current values as a JSON object
+<Set> set '<json>' <type> # apply the values, then publish the twin
+<Set> sets                # optional: list the types this plugin serves
+<Set> init                # optional: publish the current values
+```
+
+One plugin may serve a whole **family** of sets. If it implements `sets`
+(printing one type name per line), the platform seeds each of those types with
+`get <type>` instead of seeding the plugin's own name; `bin/parameter-update`
+routes a `<name>_*` type back to the `<name>` plugin. The built-in `flow_params`
+plugin works this way: it discovers one set per installed thin-edge flow
+(`flow_params_<mapper>_<flow>`) and serves them all.
+
+```sh
+# install
+ln -sf /opt/<name>/parameter-plugins/MySet /opt/tedge/parameter-plugins/MySet
+# uninstall
+rm -f /opt/tedge/parameter-plugins/MySet
+```
+
+Then add `MySet` to `MOD_PARAMETERS_SETS` in `/opt/tedge/etc/parameters` so the
+platform **seeds** it at boot.
+
+*Seeding* means publishing the device's current values to the cloud, so the
+managed object has something to show. The device publishes a retained twin
+message (`te/device/main///twin/<Set>`), the c8y mapper turns it into an
+inventory update, and the value becomes a fragment on the managed object.
+Cumulocity never asks the device for a value — it only knows what the device has
+told it. The Parameters tab needs **both** halves: the DTM definition (the
+schema) and that fragment (the value); supporting `c8y_ParameterUpdate` says
+only that the device *can* change parameters, not what they currently are.
+
+`/opt/tedge/bin/parameter-seed` does this at every start — calling `get` on each
+listed set rather than replaying a value published once — because the underlying
+files change out of band (SSH, a configuration push, a module upgrade restoring
+defaults). Each plugin publishes again right after applying a change, for the
+same reason. Upstream solves this with a `tedge-inventory` scripts.d snippet or
+a one-off manual `tedge mqtt pub -r`; neither is available in the standalone
+bundle.
+
+Rules worth following — the platform's own plugins
+(`modules/tedge/merge/parameter-plugins/{Metrics,Relay,Container}`) are the
+reference implementation:
+
+- **Validate every value.** The payload comes from the cloud. If it ends up in a
+  file that is *sourced* as root, an unchecked value is remote code execution.
+  Use `/opt/tedge/bin/parameter-setconf [--check|--write] <file> <KEY>
+  <bool|int|word> <value>`; run a full `--check` pass before the first `--write`
+  so one bad field rejects the update instead of half-applying it.
+- **Treat absent fields as unchanged**, and use jq's `has()` rather than `//` so
+  an explicit `false` is not mistaken for "not supplied".
+- **Check the payload shape before parsing it.** The values come from the
+  workflow as `${.payload.parameters}`, substituted as the *raw* value: an
+  object arrives as JSON, but a **scalar** set (a DTM property whose schema is a
+  number or string, not an object) arrives as a bare token — a JSON string
+  `"soon"` reaches the script as `soon`, which jq cannot parse. Under `set -e` a
+  failing `$(jq ...)` aborts the script before it can explain itself, and the
+  operator gets a generic error. Validate first (`jq -e 'type == "object"'`, or
+  `|| true` around the extraction) and say what was expected.
+- **A scalar set is a legitimate shape.** A DTM property whose schema is a
+  number or string sends a bare value, and the dispatcher passes it through
+  untouched (upstream's `.operation[<Set>]` already does this).
+  `parameter-plugins/relayAutoOffTime` is the example: it binds one cloud
+  parameter to one device setting under the cloud's own name and accepts either
+  `5` or `{"relayAutoOffTime": 5}`.
+- **Publish the applied state** (`tedge mqtt pub -r te/device/main///twin/<Set>
+  "$(get)"`) at the end of `set`, so the cloud shows what actually landed.
+- **Reload narrowly.** `/opt/tedge/etc/init reload <feature>` restarts a single
+  built-in feature; a full module restart re-runs `tedge connect` (~30 s).
+- Keep stdout clean; write progress to stderr. The dispatcher runs inside a
+  thin-edge workflow, whose script output is a control channel.
+- **Report the cause, not the exit code.** For a failing script, tedge-agent
+  takes the operation's `reason` from a `{"reason": "..."}` object printed
+  between `:::begin-tedge:::` / `:::end-tedge:::`; the `on_error` reason in a
+  workflow file only applies when the script cannot be launched. Without it the
+  operator sees "returned exit code 1" in Cumulocity. `bin/parameter-update`
+  does this for you — it reports the last line of a plugin's stderr — so a
+  plugin only has to write a clear message to stderr and exit non-zero.
+- **Edit files in place** rather than regenerating them, so an operator's
+  comments survive a cloud update (`bin/parameter-setconf` for shell config,
+  `set_toml_key` in `parameter-plugins/flow_params` for TOML).
+
+The parameter set is only *visible* once a matching property definition exists in
+the tenant's Digital Twin Manager (and the `dtm` + `device-parameter`
+microservices are subscribed) — the device declares nothing per parameter beyond
+supporting `c8y_ParameterUpdate` and publishing the value. The definition's
+`contexts` decide what the UI does: `asset` + `event` shows the value,
+`asset` + `event` + `operation` makes it editable, and `asset` alone shows
+nothing. See `scripts/c8y-parameter-definitions.sh` for the definitions of the
+built-in sets and use it as a template for your own.
+
+[c8y-params]: https://cumulocity.com/docs/device-management-application/managing-device-parameters/
+
 ## Anatomy of an extension module
 
 Generated by `scripts/new-extension.sh <name>`:
@@ -180,7 +354,9 @@ multiple outputs via `MOD_RELAY_OUTPUTS`, with OPEN/CLOSED state reflected back
 into the managed object), plus its settings (`/opt/tedge/etc/relay`) registered
 for cloud configuration management. The built-in **metrics** poller
 (`modules/tedge/merge/bin/metrics-monitor`) illustrates Pattern A — a participant
-publishing on the local MQTT bus. As built-ins, these ship as native platform
-files rather than being symlinked/registered from a separate `/opt/<name>` tree;
+publishing on the local MQTT bus, and the parameter sets under
+`modules/tedge/merge/parameter-plugins/` illustrate Pattern E (`Metrics` is the
+simplest, `flow_params` shows a set family). As built-ins,
+these ship as native platform files rather than being symlinked/registered from a separate `/opt/<name>` tree;
 a third-party extension applies the same patterns from its own module. For a
 fresh Pattern A scaffold, see the output of `scripts/new-extension.sh`.

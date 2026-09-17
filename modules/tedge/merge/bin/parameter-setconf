@@ -1,0 +1,75 @@
+#!/bin/sh
+# parameter-setconf -- set a MOD_* key in one of the module's shell config files
+# (etc/metrics, etc/relay, etc/container, ...), with strict value validation.
+#
+#   parameter-setconf [--check|--write] <file> <KEY> <bool|int|word> <value>
+#
+# --check validates the value and writes nothing; --write (the default) also
+# applies it. The parameter plugins run a full --check pass before the --write
+# pass, so one bad field rejects the whole update instead of leaving the config
+# half-applied (and the cloud twin out of sync with the file).
+#
+# WHY THE VALIDATION MATTERS: these files are *sourced* by etc/init and by the
+# pollers, as root. A value arriving from the cloud (a c8y_ParameterUpdate
+# operation) that contained shell metacharacters would otherwise be executed --
+# so every value is checked against its kind before it is written, and anything
+# unexpected is rejected with a non-zero exit (which fails the operation).
+#
+#   bool   true/false/1/0/yes/no/on/off          -> written as 1 or 0
+#   int    digits only                           -> written as-is
+#   word   letters, digits, space . , : + - _ /  -> written double-quoted
+#
+# The key is rewritten in place, keeping the file's comments and ordering; if it
+# is absent it is appended. Used by the parameter plugins (parameter-plugins/).
+set -u
+
+MODE=--write
+case "${1-}" in
+    --check|--write) MODE="$1"; shift ;;
+esac
+
+FILE="${1:?config file required}"
+KEY="${2:?key required}"
+KIND="${3:?kind required}"
+VALUE="${4-}"
+
+case "$KEY" in
+    ""|*[!A-Z0-9_]*) echo "parameter-setconf: invalid key '$KEY'" >&2; exit 1 ;;
+esac
+[ -f "$FILE" ] || { echo "parameter-setconf: no such config file: $FILE" >&2; exit 1; }
+
+case "$KIND" in
+    bool)
+        case "$VALUE" in
+            true|1|yes|on|True|TRUE)    OUT=1 ;;
+            false|0|no|off|False|FALSE) OUT=0 ;;
+            *) echo "parameter-setconf: $KEY expects a boolean, got '$VALUE'" >&2; exit 1 ;;
+        esac
+        ;;
+    int)
+        case "$VALUE" in
+            ""|*[!0-9]*) echo "parameter-setconf: $KEY expects an integer, got '$VALUE'" >&2; exit 1 ;;
+            *) OUT="$VALUE" ;;
+        esac
+        ;;
+    word)
+        # Deliberately narrow: no quotes, no $ ` \ ; & | ( ) < > newline.
+        case "$VALUE" in
+            *[!A-Za-z0-9\ ._,:+/-]*)
+                echo "parameter-setconf: $KEY contains unsupported characters: '$VALUE'" >&2; exit 1 ;;
+            *) OUT="\"$VALUE\"" ;;
+        esac
+        ;;
+    *)
+        echo "parameter-setconf: unknown kind '$KIND'" >&2; exit 1 ;;
+esac
+
+[ "$MODE" = "--check" ] && exit 0
+
+TMP="$FILE.tmp.$$"
+awk -v k="$KEY" -v v="$OUT" '
+    $0 ~ "^[[:space:]]*"k"=" { if (!done) { print k "=" v; done=1 } ; next }
+    { print }
+    END { if (!done) print k "=" v }
+' "$FILE" > "$TMP" || { rm -f "$TMP"; exit 1; }
+mv "$TMP" "$FILE"

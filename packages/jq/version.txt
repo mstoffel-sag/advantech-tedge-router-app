@@ -1,0 +1,20 @@
+jq release pinned for this Router App.
+
+  version: 1.8.2
+  source:  https://github.com/jqlang/jq/releases/tag/jq-1.8.2
+
+jq is a statically linked, dependency-free JSON processor. It is bundled because
+ICR-OS provides no JSON tooling, and the device-parameter feature
+(c8y_ParameterUpdate) has to parse cloud-supplied JSON payloads. It lands at
+/opt/tedge/bin/jq, which is on the PATH set by /opt/tedge/env (and by the S99
+service scripts), so `jq` resolves for tedge-agent's workflow scripts, for the
+parameter plugins and over SSH.
+
+Architectures used per ICR platform (jq release asset suffix):
+  v2i  -> jq-linux-armel
+  v3   -> jq-linux-armhf
+  v4   -> jq-linux-arm64
+  v4i  -> jq-linux-arm64    (ICR-1642)
+
+To upgrade, bump JQ_VERSION in packages/jq/Makefile, update this file and
+modules/tedge/CHANGELOG.txt, then rebuild.
