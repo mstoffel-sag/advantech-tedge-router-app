@@ -125,46 +125,38 @@ tolerates unparseable input.
 - ✔ The `c8y api --template` invocation inside that script: a `--dry` run
   against the tenant session shows the definition body sent intact.
 
-## 7. Still open
+## 7. Release validation (1.0.16, installed from the built .tgz)
 
-- ☐ Reboot persistence. Not exercised: this router carries an unrelated
-  container demo that a reboot would disturb. The pieces it depends on are
-  boot-path code already covered above (`etc/init start` → `start_parameters`,
-  agent publishes the capability, mapper re-creates the symlink).
-- ☐ `v2i` / `v3` platforms (see 1).
-- ☐ A full `.tgz` install (this validation overlaid the files onto a running
-  1.0.15 install and ran the one install-hook step by hand,
-  `tedge-config-register add parameters`). The build itself needs the
-  ModulesSDK, i.e. CI.
-- ✔ **An upgrade no longer discards the operator's artifacts.** ICR-OS still
-  wipes `/opt/tedge`, but `bin/tedge-persist` saves the feature configs
-  (`etc/{metrics,relay,container,parameters}`, `etc/settings`) and every flow the
-  app does not ship into `/opt/tedge-data/persist` — from `etc/uninstall` (which
-  ICR-OS runs on an upgrade) and `etc/init stop` — and `etc/install` restores
-  them. Rehearsed on the device: saved, deleted the flow, reset
-  `MOD_RELAY_ACTIVE_LOW` to the shipped default, restored — flow back with its
-  comments intact, polarity preserved, shipped config kept as `etc/relay.dist`.
-  Rehearsed again with an **operator-added parameter plugin** (`relayAutoOffTime`,
-  which the release does not ship): saved, wiped, restored executable and
-  working, and the operator's `MOD_PARAMETERS_SETS` — which lists it — restored
-  with it.
-- ✔ **Confirmed by a real `.tgz` upgrade** of the router from 1.0.15 to 1.0.16
-  (2026-09-17): the flow, the operator-added `relayAutoOffTime` plugin, that
-  operator's `MOD_PARAMETERS_SETS`, `MOD_RELAY_ACTIVE_LOW=0` and the Cumulocity
-  connection settings all came back; the shipped versions were kept as
-  `etc/{metrics,parameters,relay,settings}.dist`; all five sets re-seeded and
-  the mapper re-created the `c8y_ParameterUpdate` symlink. Cloud operations
-  against the installed release then succeeded (`Metrics.interval`,
-  `relayAutoOffTime`) and an invalid value was still rejected with its real
-  reason.
-- **ICR-OS wipes `etc/settings` on an upgrade.** Proven by that install:
-  `settings.dist` — what the new version's own `etc/install` left behind — is
-  `MOD_TEDGE_ENABLED=0` with an empty Cumulocity URL. Without `tedge-persist`
-  the module comes back **disabled and unconfigured** after every upgrade.
-- **Flaw found by that same install:** `mappers/.shipped-flows` was empty,
-  because the mapper generates its built-in flows at runtime rather than the
-  package shipping them — so the manifest alone would have caused the stock
-  flows to be treated as the operator's on the next save. Fixed by carrying only
-  flow *directories* (how the flows plugin installs them); verified against the
-  live post-upgrade state, where the store now holds `relay-auto-open` and none
-  of the eleven stock `*.toml` files.
+- ✔ **Real `.tgz` upgrade**, 1.0.15 → 1.0.16 through the router's own module
+  update (not a hand-overlay): the flow, the operator-added `relayAutoOffTime`
+  plugin, that operator's `MOD_PARAMETERS_SETS`, `MOD_RELAY_ACTIVE_LOW=0` and the
+  Cumulocity connection settings all came back, with the shipped versions kept
+  as `etc/{metrics,parameters,relay,settings}.dist`. Cloud operations against the
+  installed release succeeded, and an invalid value was still rejected with its
+  real reason.
+- ✔ **ICR-OS wipes `etc/settings` on an upgrade** — `settings.dist`, what the
+  new version's own `etc/install` left behind, is `MOD_TEDGE_ENABLED=0` with an
+  empty Cumulocity URL. Without `tedge-persist` the module comes back disabled
+  and unconfigured, and the device goes silent until someone re-enters the
+  settings in the web UI.
+- ✔ **Reboot**: every service back, `parameters: enabled` with all five sets,
+  capability retained, `c8y_ParameterUpdate` symlink in place, all five sets
+  re-seeded from the boot path, mapper healthy (`JWT token received`). Cloud
+  operations after the cold boot succeeded (`relayAutoOffTime` 2→4→2,
+  `Metrics.interval` 60→45→60), so workflow dispatch works from a cold start and
+  not only seeding. The `save` on shutdown kept the store to `relay-auto-open`
+  plus the operator plugin — it did not adopt the mapper's regenerated built-ins.
+
+## 8. Still open
+
+- ☐ `v2i` (armv5/armel) and `v3` (armv7/armhf), and `v4i` (ICR-1642): built by
+  CI but not run on hardware. Only `v4` was exercised here.
+- ☐ How Device Management > **Parameters** renders the sets — needs the Digital
+  Twin Manager property definitions, which need an admin session
+  (`scripts/c8y-parameter-definitions.sh create`). Everything the device owes
+  the UI is verified. The existing `relayAutoOffTime` definition also needs
+  `event` and `operation` added to its "Applicable To"; with `asset` alone it
+  renders nothing.
+- ☐ The `save` half of the upgrade path in anger: 1.0.15 had no `tedge-persist`,
+  so this upgrade exercised only `restore` (the store was primed by hand
+  beforehand). The next upgrade is the first to run both halves.
