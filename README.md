@@ -351,7 +351,16 @@ tail -f /var/log/tedge/*.log    # logs (mosquitto / mapper / agent)
 Bump `TEDGE_VERSION` in `packages/tedge/Makefile`, update
 `packages/tedge/version.txt` and `modules/tedge/CHANGELOG.txt`, then rebuild.
 Config files are shipped as `*.default` and are **not** overwritten on reinstall,
-so operator settings survive upgrades. The device certificate/key also survive
+so operator settings survive upgrades. Beyond that, `bin/tedge-persist` carries
+the operator's own artifacts across the wipe an ICR-OS module upgrade performs —
+the cloud-editable feature configs (`etc/{metrics,relay,container,parameters}`),
+`etc/settings`, and **every flow the app does not ship** (a flow installed from
+Cumulocity's Software tab lives inside `/opt/tedge/mappers/` and was previously
+destroyed by an upgrade). They are saved to `/opt/tedge-data/persist` by
+`etc/uninstall` (which ICR-OS runs on an upgrade) and by `etc/init stop`, and
+restored by `etc/install`; where the new version ships a different config file,
+yours wins and the shipped one is kept alongside as `<file>.dist`. Inspect the
+store with `/opt/tedge/bin/tedge-persist status`. The device certificate/key also survive
 (see [Device identity, upgrades & removal](#device-identity-upgrades--removal)),
 so upgrading does not re-register the device in Cumulocity.
 

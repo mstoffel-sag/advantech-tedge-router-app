@@ -63,6 +63,30 @@ chmod +x /opt/tedge-data/etc/init 2>/dev/null || true
 # Make sure the bundled scripts are executable.
 chmod +x "$MOD_DIR/bin/"* "$MOD_DIR/etc/init" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Carry the operator's own artifacts across this upgrade.
+#
+# ICR-OS replaced /opt/tedge wholesale to get here, which destroys anything the
+# operator added inside it -- flows installed from Cumulocity's Software tab,
+# and the cloud-editable feature configs. bin/tedge-persist saved them to
+# /opt/tedge-data/persist (from etc/uninstall, which runs on an upgrade too, and
+# from etc/init stop); restore them now.
+#
+# First record which flows THIS version ships, so a later save can tell them
+# apart from the operator's. Anything already held in the persistent store is
+# the operator's by definition and is never recorded as shipped -- that keeps a
+# manual re-run of this script from disowning a flow.
+install -d "$MOD_DIR/mappers" 2>/dev/null || true
+: > "$MOD_DIR/mappers/.shipped-flows"
+for d in "$MOD_DIR"/mappers/*/flows/*; do
+    [ -e "$d" ] || continue
+    fname=$(basename "$d")
+    fmapper=$(basename "$(dirname "$(dirname "$d")")")
+    [ -e "/opt/tedge-data/persist/flows/$fmapper/$fname" ] && continue
+    echo "$fmapper/$fname" >> "$MOD_DIR/mappers/.shipped-flows"
+done
+[ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" restore || true
+
 # Convenience: expose the tedge CLI on the system PATH.
 [ -d "$PREFIX/usr/bin" ] || mkdir -p "$PREFIX/usr/bin"
 [ -e "$PREFIX/usr/bin/tedge" ] || ln -sf "$MOD_DIR/bin/tedge" "$PREFIX/usr/bin/tedge"

@@ -6,7 +6,8 @@ workflow is `/opt/tedge/operations/parameter_update.toml`, the dispatcher
 `/opt/tedge/parameter-plugins/{Metrics,Relay,Container,flow_params,relayAutoOffTime}` and the
 config `/opt/tedge/etc/parameters`.
 
-**Verified on hardware, 2026-09-17** — ICR-4401W1S (`v4i`, aarch64), ICR-OS
+**Verified on hardware, 2026-09-17** — ICR-4401W1S (platform **`v4`**, aarch64;
+`/proc/device-tree/model` reports `RBv4`), firmware 6.6.1, ICR-OS
 busybox 1.36, module 1.0.15 tree with the 1.0.16 files overlaid, tedge 2.0.1-3,
 against the `mstoffel.eu-latest` Cumulocity tenant. Operations were created
 through the device's own Cumulocity auth proxy (`http://localhost:8001/c8y`),
@@ -24,7 +25,7 @@ Legend: ✔ verified on device, ☐ still open.
   keeps the feature independent of firmware content — but if the whole fleet is
   known to ship jq, `packages/jq` could be dropped to save ~1.8 MB.
 - ☐ `v2i` (armv5/armel) and `v3` (armv7/armhf): the same static builds are
-  published upstream but were not run here.
+  published upstream but were not run here (nor `v4i`, the ICR-1642).
 
 ## 2. The operation is announced
 
@@ -38,8 +39,9 @@ Legend: ✔ verified on device, ☐ still open.
 
 ## 3. Seeding
 
-- ✔ `parameter-seed` published all four sets (`Metrics`, `Relay`, `Container`,
-  and the flow set `flow_params_c8y_relay-auto-open` discovered on this router).
+- ✔ `parameter-seed` published every set: `Metrics`, `Relay`, `Container`,
+  `relayAutoOffTime`, and the flow set `flow_params_c8y_relay-auto-open`
+  discovered on this router.
 - ✔ The cloud managed object carries the matching fragments, with the values
   from `/opt/tedge/etc/{metrics,relay,container}` and the flow's `params.toml` —
   including values that differ from the shipped defaults, so it reflects the
@@ -133,7 +135,13 @@ tolerates unparseable input.
   1.0.15 install and ran the one install-hook step by hand,
   `tedge-config-register add parameters`). The build itself needs the
   ModulesSDK, i.e. CI.
-- Note: as with `etc/metrics` and `etc/relay`, `/opt/tedge/etc/parameters` is
-  **replaced** on a module upgrade (ICR-OS wipes `/opt/tedge`; only
-  `/opt/tedge-data` survives). Snapshot the `parameters` config type first, or
-  re-push it afterwards.
+- ✔ **An upgrade no longer discards the operator's artifacts.** ICR-OS still
+  wipes `/opt/tedge`, but `bin/tedge-persist` saves the feature configs
+  (`etc/{metrics,relay,container,parameters}`, `etc/settings`) and every flow the
+  app does not ship into `/opt/tedge-data/persist` — from `etc/uninstall` (which
+  ICR-OS runs on an upgrade) and `etc/init stop` — and `etc/install` restores
+  them. Rehearsed on the device: saved, deleted the flow, reset
+  `MOD_RELAY_ACTIVE_LOW` to the shipped default, restored — flow back with its
+  comments intact, polarity preserved, shipped config kept as `etc/relay.dist`.
+- ☐ The same path driven by a real `.tgz` install (the rehearsal called
+  `tedge-persist` directly rather than going through ICR-OS's own upgrade).

@@ -1,0 +1,133 @@
+#!/bin/sh
+# tedge-persist -- carry the operator's own artifacts across a Router App upgrade.
+#
+#   tedge-persist save      # copy them out of the module tree (before it is replaced)
+#   tedge-persist restore   # copy them back (after the new tree is in place)
+#   tedge-persist status    # show what is currently held
+#
+# WHY: ICR-OS replaces /opt/<module> wholesale on every upgrade. Everything the
+# app ships comes back -- but everything the *operator* added or changed inside
+# that tree is destroyed, and nothing in the platform noticed. That includes:
+#
+#   * flows installed from Cumulocity (Software tab, type `flow`), which the
+#     flows plugin unpacks into mappers/<mapper>/flows/<name>/ -- inside the
+#     module tree. Install a flow from the cloud, upgrade the app, flow gone.
+#   * the feature configs etc/{metrics,relay,container,parameters}, editable
+#     from the cloud as configuration types -- an upgrade silently reverted them
+#     to the shipped defaults (e.g. relay polarity back to active-low).
+#   * etc/settings: the Cumulocity connection settings.
+#
+# The store is /opt/tedge-data/persist -- the same partition and the same
+# self-cleaning guard as the device certificate (see etc/install): it survives an
+# upgrade because it is outside the module tree, and is removed on a genuine
+# delete by /opt/tedge-data/etc/init.
+#
+# `save` runs from etc/uninstall (which ICR-OS also runs on an upgrade, right
+# before the tree is replaced) and from etc/init stop, so an interrupted upgrade
+# still has a recent copy. `restore` runs from etc/install.
+#
+# Shipped flows are NOT saved: etc/install records them in mappers/.shipped-flows
+# at install time, and the new version brings its own (they change with the
+# bundled thin-edge.io version, so the shipped copies must win).
+set -u
+
+MOD_DIR=/opt/tedge
+PERSIST=/opt/tedge-data/persist
+MANIFEST="$MOD_DIR/mappers/.shipped-flows"
+CONFIGS="metrics relay container parameters settings"
+
+log() { echo "tedge-persist: $1"; }
+
+# The two layouts differ in depth, so each has its own id helper:
+#   module tree:      <MOD_DIR>/mappers/<mapper>/flows/<name>
+#   persistent store: <PERSIST>/flows/<mapper>/<name>
+# Both yield "<mapper>/<name>".
+flow_id() {          # module tree
+    echo "$(basename "$(dirname "$(dirname "$1")")")/$(basename "$1")"
+}
+persist_id() {       # persistent store
+    echo "$(basename "$(dirname "$1")")/$(basename "$1")"
+}
+
+is_shipped() { grep -qx "$1" "$MANIFEST" 2>/dev/null; }
+
+# ICR-OS busybox has no diff and no md5sum/sha*sum -- but it does have cmp.
+same_file() { cmp -s "$1" "$2" 2>/dev/null; }
+
+save() {
+    mkdir -p "$PERSIST/etc" 2>/dev/null || true
+    chmod 700 "$PERSIST" 2>/dev/null || true
+
+    # Flows: mirror, so a flow the operator deleted does not come back.
+    rm -rf "$PERSIST/flows"
+    n=0
+    for d in "$MOD_DIR"/mappers/*/flows/*; do
+        [ -e "$d" ] || continue
+        id=$(flow_id "$d")
+        is_shipped "$id" && continue
+        mkdir -p "$PERSIST/flows/${id%/*}"
+        cp -a "$d" "$PERSIST/flows/${id%/*}/" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "saved $n flow(s) not shipped by this app"
+
+    # Feature configs and the module settings.
+    for f in $CONFIGS; do
+        [ -f "$MOD_DIR/etc/$f" ] || continue
+        cp -a "$MOD_DIR/etc/$f" "$PERSIST/etc/$f"
+    done
+    chmod 600 "$PERSIST/etc/settings" 2>/dev/null || true
+    return 0
+}
+
+restore() {
+    [ -d "$PERSIST" ] || return 0
+
+    # Flows: never clobber one the new version ships under the same name.
+    n=0
+    for d in "$PERSIST"/flows/*/*; do
+        [ -e "$d" ] || continue
+        id=$(persist_id "$d")
+        dest="$MOD_DIR/mappers/${id%/*}/flows/${id#*/}"
+        if [ -e "$dest" ]; then
+            log "flow ${id} is already present; leaving it alone"
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        cp -a "$d" "$(dirname "$dest")/" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "restored $n flow(s) across the upgrade"
+
+    # Configs: the operator's file wins, but keep the shipped one alongside as
+    # *.dist so new settings introduced by an upgrade are still discoverable.
+    for f in $CONFIGS; do
+        [ -f "$PERSIST/etc/$f" ] || continue
+        if [ -f "$MOD_DIR/etc/$f" ] && ! same_file "$PERSIST/etc/$f" "$MOD_DIR/etc/$f"; then
+            cp -a "$MOD_DIR/etc/$f" "$MOD_DIR/etc/$f.dist"
+            log "kept your etc/$f (this version ships etc/$f.dist)"
+        fi
+        cp -a "$PERSIST/etc/$f" "$MOD_DIR/etc/$f"
+    done
+    chmod 600 "$MOD_DIR/etc/settings" 2>/dev/null || true
+    return 0
+}
+
+status() {
+    echo "persistent store: $PERSIST"
+    if [ -d "$PERSIST/flows" ]; then
+        for d in "$PERSIST"/flows/*/*; do
+            [ -e "$d" ] && echo "  flow:   $(persist_id "$d")"
+        done
+    fi
+    for f in $CONFIGS; do
+        [ -f "$PERSIST/etc/$f" ] && echo "  config: etc/$f"
+    done
+    [ -f "$MANIFEST" ] && echo "  shipped flows recorded: $(wc -l < "$MANIFEST")"
+    return 0
+}
+
+case "${1:-}" in
+    save)    save ;;
+    restore) restore ;;
+    status)  status ;;
+    *) echo "usage: tedge-persist {save|restore|status}" >&2; exit 2 ;;
+esac

@@ -160,7 +160,18 @@ EOT
             cert_path=$(tedge config get device.cert_path 2>/dev/null)
             if [ ! -f "$cert_path" ]; then
                 otp=$MOD_TEDGE_OTP
-                [ -n "$otp" ] || otp=$(printf "%s" "$dev_id" | md5sum | awk '{print $1}')
+                # Fall back to the documented md5-of-device-id -- but only if a
+                # digest tool exists. This firmware's busybox has no md5sum (nor
+                # sha*sum/cksum), where this silently produced an EMPTY one-time
+                # password and every registration attempt failed with no hint why.
+                if [ -z "$otp" ]; then
+                    if type md5sum >/dev/null 2>&1; then
+                        otp=$(printf "%s" "$dev_id" | md5sum | awk '{print $1}')
+                    else
+                        log "ERROR: no one-time password set and md5sum is not available on this firmware;"
+                        log "       set MOD_TEDGE_OTP in the module settings to the password you entered in Cumulocity."
+                    fi
+                fi
                 c8y_host=$(tedge config get c8y.url 2>/dev/null)
                 if [ -n "$c8y_host" ]; then
                     # Do NOT log the one-time password: log() writes to syslog
@@ -465,6 +476,10 @@ start_tedge() {
 
 stop_tedge() {
     log "Stopping $MOD_NAME"
+    # Keep the upgrade-safe copy of the operator's flows and feature configs
+    # current (bin/tedge-persist). etc/uninstall does this too; doing it on every
+    # stop means an upgrade that skips uninstall still finds a recent copy.
+    [ -x "$BIN/tedge-persist" ] && "$BIN/tedge-persist" save >/dev/null 2>&1
     stop_parameters
     stop_container
     stop_relay

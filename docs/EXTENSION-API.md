@@ -182,9 +182,14 @@ Test it without the cloud:
 ```
 
 > A plugin dropped into `/opt/tedge` is **wiped by a module upgrade** (ICR-OS
-> replaces the module tree). For a throwaway that is fine; anything permanent
-> belongs in the repo at `modules/tedge/merge/parameter-plugins/<Set>`, with its
-> name in the shipped `merge/etc/parameters`, so it is part of the app.
+> replaces the module tree). Unlike the feature *configs* and installed flows,
+> which `bin/tedge-persist` carries across, plugin scripts are not preserved —
+> the app cannot tell a dropped-in script from one it used to ship. For a
+> throwaway that is fine; anything permanent belongs in the repo at
+> `modules/tedge/merge/parameter-plugins/<Set>`, with its name in the shipped
+> `merge/etc/parameters`, so it is part of the app. An extension module should
+> install its plugin from its own `/opt/<name>` tree in its `install` hook,
+> which an upgrade of *this* module does not touch.
 
 #### The plugin contract
 

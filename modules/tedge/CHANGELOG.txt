@@ -110,6 +110,27 @@ thin-edge.io Router App - Changelog
       disabled, TOML key injection, unknown flow). See
       docs/ON-DEVICE-VALIDATION-PARAMETERS.md for the record and what is still
       open (reboot, the v2i/v3 platforms, the Parameters tab rendering).
+* Upgrades no longer destroy the operator's own artifacts. ICR-OS replaces
+  /opt/<module> wholesale, so everything added INSIDE the module tree was lost on
+  every update -- most importantly any flow installed from Cumulocity's Software
+  tab (the flows plugin unpacks them into mappers/<mapper>/flows/), and the
+  cloud-editable feature configs, which silently reverted to the shipped
+  defaults (e.g. relay polarity back to active-low). New bin/tedge-persist saves
+  them to /opt/tedge-data/persist -- the same partition and self-cleaning guard
+  as the device certificate -- from etc/uninstall (which ICR-OS also runs on an
+  upgrade, right before the tree is replaced) and from etc/init stop; etc/install
+  restores them into the new tree. Shipped flows are excluded via a manifest
+  (mappers/.shipped-flows) written at install time, so the new version's own
+  flows always win; a restored config file wins over the shipped one, which is
+  kept alongside as <file>.dist so new settings stay discoverable. Inspect with
+  `tedge-persist status`. Rehearsed on device: flow restored with its comments,
+  MOD_RELAY_ACTIVE_LOW preserved across a simulated wipe.
+* Fixed: the c8y-ca one-time-password fallback produced an EMPTY password on
+  firmware without md5sum. etc/init documented "leave MOD_TEDGE_OTP empty to
+  derive md5 of the device id", but this ICR-OS busybox has no md5sum (nor
+  sha*sum or cksum), so the fallback silently yielded nothing and registration
+  failed with no explanation. It now checks for the tool and, when absent, logs
+  that MOD_TEDGE_OTP must be set explicitly.
 * New package packages/jq: the parameter dispatcher has to parse cloud-supplied
   JSON, and ICR-OS busybox provides no JSON tooling. The statically linked jq
   1.8.2 binary for the target architecture (armel/armhf/arm64, ~1.8 MB) is
