@@ -66,10 +66,16 @@ save() {
     chmod 700 "$PERSIST" 2>/dev/null || true
 
     # Flows: mirror, so a flow the operator deleted does not come back.
+    #
+    # Only DIRECTORIES count. The flows plugin installs every flow as a
+    # directory (mappers/<mapper>/flows/<name>/), whereas the mapper's built-in
+    # flows are flat <name>.toml files it regenerates at runtime -- they are not
+    # in the package at all, which is why the .shipped-flows manifest recorded
+    # at install time is empty on a fresh install and cannot be relied on alone.
     rm -rf "$PERSIST/flows"
     n=0
     for d in "$MOD_DIR"/mappers/*/flows/*; do
-        [ -e "$d" ] || continue
+        [ -d "$d" ] || continue
         id=$(flow_id "$d")
         is_shipped "$id" && continue
         mkdir -p "$PERSIST/flows/${id%/*}"

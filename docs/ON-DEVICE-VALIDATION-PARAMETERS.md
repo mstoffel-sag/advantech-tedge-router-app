@@ -148,5 +148,23 @@ tolerates unparseable input.
   which the release does not ship): saved, wiped, restored executable and
   working, and the operator's `MOD_PARAMETERS_SETS` — which lists it — restored
   with it.
-- ☐ The same path driven by a real `.tgz` install (the rehearsal called
-  `tedge-persist` directly rather than going through ICR-OS's own upgrade).
+- ✔ **Confirmed by a real `.tgz` upgrade** of the router from 1.0.15 to 1.0.16
+  (2026-09-17): the flow, the operator-added `relayAutoOffTime` plugin, that
+  operator's `MOD_PARAMETERS_SETS`, `MOD_RELAY_ACTIVE_LOW=0` and the Cumulocity
+  connection settings all came back; the shipped versions were kept as
+  `etc/{metrics,parameters,relay,settings}.dist`; all five sets re-seeded and
+  the mapper re-created the `c8y_ParameterUpdate` symlink. Cloud operations
+  against the installed release then succeeded (`Metrics.interval`,
+  `relayAutoOffTime`) and an invalid value was still rejected with its real
+  reason.
+- **ICR-OS wipes `etc/settings` on an upgrade.** Proven by that install:
+  `settings.dist` — what the new version's own `etc/install` left behind — is
+  `MOD_TEDGE_ENABLED=0` with an empty Cumulocity URL. Without `tedge-persist`
+  the module comes back **disabled and unconfigured** after every upgrade.
+- **Flaw found by that same install:** `mappers/.shipped-flows` was empty,
+  because the mapper generates its built-in flows at runtime rather than the
+  package shipping them — so the manifest alone would have caused the stock
+  flows to be treated as the operator's on the next save. Fixed by carrying only
+  flow *directories* (how the flows plugin installs them); verified against the
+  live post-upgrade state, where the store now holds `relay-auto-open` and none
+  of the eleven stock `*.toml` files.

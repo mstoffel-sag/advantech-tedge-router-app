@@ -123,7 +123,11 @@ thin-edge.io Router App - Changelog
   upgrade, right before the tree is replaced) and from etc/init stop; etc/install
   restores them into the new tree. Shipped flows are excluded via a manifest
   (mappers/.shipped-flows, and parameter-plugins/.shipped for the plugins)
-  written at install time, so the new version's own copies always win; a restored config file wins over the shipped one, which is
+  written at install time, so the new version's own copies always win. Only flow
+  DIRECTORIES are carried: the flows plugin installs each flow as a directory,
+  while the mapper's built-in flows are flat *.toml files it regenerates at
+  runtime and which are not in the package at all -- so the flow manifest is
+  legitimately empty on a fresh install and must not be the only filter; a restored config file wins over the shipped one, which is
   kept alongside as <file>.dist so new settings stay discoverable. Inspect with
   `tedge-persist status`. Rehearsed on device: flow restored with its comments,
   MOD_RELAY_ACTIVE_LOW preserved across a simulated wipe.

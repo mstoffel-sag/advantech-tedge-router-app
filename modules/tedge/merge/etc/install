@@ -76,10 +76,14 @@ chmod +x "$MOD_DIR/bin/"* "$MOD_DIR/etc/init" 2>/dev/null || true
 # apart from the operator's. Anything already held in the persistent store is
 # the operator's by definition and is never recorded as shipped -- that keeps a
 # manual re-run of this script from disowning a flow.
+# Only directories are considered: the flows plugin installs a flow as a
+# directory, while the mapper's built-in flows are flat *.toml files it
+# regenerates at runtime (they are not in the package, so this manifest is
+# legitimately empty on a fresh install).
 install -d "$MOD_DIR/mappers" 2>/dev/null || true
 : > "$MOD_DIR/mappers/.shipped-flows"
 for d in "$MOD_DIR"/mappers/*/flows/*; do
-    [ -e "$d" ] || continue
+    [ -d "$d" ] || continue
     fname=$(basename "$d")
     fmapper=$(basename "$(dirname "$(dirname "$d")")")
     [ -e "/opt/tedge-data/persist/flows/$fmapper/$fname" ] && continue
