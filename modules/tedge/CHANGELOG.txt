@@ -30,14 +30,15 @@ thin-edge.io Router App - Changelog
       flow's parameters survive a cloud update, and it needs no `sudo
       tedge-write` (Router Apps run as root). A plugin serving a family lists
       its types via a new `sets` command, which bin/parameter-seed expands.
-    - relayAutoOffTime: a SCALAR parameter set, and the worked example of
-      binding one cloud parameter to one device setting under the cloud's own
-      name -- it drives the delay of the relay-auto-open flow (its params.toml
-      `delay_minutes`). Where Metrics/Relay/Container take a field map, a Digital
-      Twin Manager property whose schema is a plain number/string sends a bare
-      value, so the dispatcher passes non-object payloads through untouched and
-      the plugin accepts either shape. Dormant when that flow is not installed
-      (its `get` prints nothing, so parameter-seed skips the set).
+    - SCALAR parameter sets are supported: where Metrics/Relay/Container take a
+      field map, a Digital Twin Manager property whose schema is a plain
+      number/string sends a bare value, so the dispatcher passes non-object
+      payloads through untouched (as upstream's .operation[<Set>] already did)
+      and a plugin can accept either shape. docs/examples/relayAutoOffTime is a
+      worked example, deliberately NOT shipped: it binds one cloud parameter to
+      one flow setting, which makes it specific to a tenant's property and to a
+      flow this app does not ship. Copy it onto a router that has both; it is
+      then carried across upgrades like any operator-added plugin.
     - bin/parameter-settoml: the TOML counterpart of bin/parameter-setconf --
       one validated, comment-preserving writer for a flow's params.toml, shared
       by flow_params and relayAutoOffTime. Enforces bare TOML keys and
@@ -116,12 +117,13 @@ thin-edge.io Router App - Changelog
   tab (the flows plugin unpacks them into mappers/<mapper>/flows/), and the
   cloud-editable feature configs, which silently reverted to the shipped
   defaults (e.g. relay polarity back to active-low). New bin/tedge-persist saves
-  them to /opt/tedge-data/persist -- the same partition and self-cleaning guard
-  as the device certificate -- from etc/uninstall (which ICR-OS also runs on an
+  them, together with any parameter plugin the operator dropped into
+  parameter-plugins/, to /opt/tedge-data/persist -- the same partition and
+  self-cleaning guard as the device certificate -- from etc/uninstall (which ICR-OS also runs on an
   upgrade, right before the tree is replaced) and from etc/init stop; etc/install
   restores them into the new tree. Shipped flows are excluded via a manifest
-  (mappers/.shipped-flows) written at install time, so the new version's own
-  flows always win; a restored config file wins over the shipped one, which is
+  (mappers/.shipped-flows, and parameter-plugins/.shipped for the plugins)
+  written at install time, so the new version's own copies always win; a restored config file wins over the shipped one, which is
   kept alongside as <file>.dist so new settings stay discoverable. Inspect with
   `tedge-persist status`. Rehearsed on device: flow restored with its comments,
   MOD_RELAY_ACTIVE_LOW preserved across a simulated wipe.

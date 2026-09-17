@@ -3,8 +3,9 @@
 Device parameters are a built-in feature of the `tedge` platform module: the
 workflow is `/opt/tedge/operations/parameter_update.toml`, the dispatcher
 `/opt/tedge/bin/parameter-update`, the parameter sets
-`/opt/tedge/parameter-plugins/{Metrics,Relay,Container,flow_params,relayAutoOffTime}` and the
-config `/opt/tedge/etc/parameters`.
+`/opt/tedge/parameter-plugins/{Metrics,Relay,Container,flow_params}` and the
+config `/opt/tedge/etc/parameters`. `relayAutoOffTime` is an operator-added
+plugin on this router (`docs/examples/`), not part of the release.
 
 **Verified on hardware, 2026-09-17** — ICR-4401W1S (platform **`v4`**, aarch64;
 `/proc/device-tree/model` reports `RBv4`), firmware 6.6.1, ICR-OS
@@ -55,7 +56,7 @@ Legend: ✔ verified on device, ☐ still open.
 | `Relay` | `pollInterval` 5 → 8 → 5 | ✔ SUCCESSFUL, `relay-monitor` restarted, `c8y_RelayArray` still rendered |
 | `Container` | `enabled` false → true | ✔ SUCCESSFUL, daemon stopped/started, `etc/init status` followed (`disabled` → `running`) |
 | `flow_params_c8y_relay-auto-open` | `delay_minutes`, plus a key not yet in the file | ✔ SUCCESSFUL, key edited **in place with the file's comments preserved**, unrelated keys untouched, new key appended |
-| `relayAutoOffTime` (scalar) | bare `4`, then `3`, then `2` | ✔ SUCCESSFUL, wrote the flow's `delay_minutes`, twin published as a **number** (`{"relayAutoOffTime":2,"type":"number"}` on the MO), mapper reloaded the flow |
+| `relayAutoOffTime` (scalar, the `docs/examples/` plugin, installed on this router only) | bare `4`, then `3`, then `2` | ✔ SUCCESSFUL, wrote the flow's `delay_minutes`, twin published as a **number** (`{"relayAutoOffTime":2,"type":"number"}` on the MO), mapper reloaded the flow |
 
 - ✔ Partial payloads leave unsent fields alone (verified on both a shell config
   file and a flow's `params.toml`).
@@ -143,5 +144,9 @@ tolerates unparseable input.
   them. Rehearsed on the device: saved, deleted the flow, reset
   `MOD_RELAY_ACTIVE_LOW` to the shipped default, restored — flow back with its
   comments intact, polarity preserved, shipped config kept as `etc/relay.dist`.
+  Rehearsed again with an **operator-added parameter plugin** (`relayAutoOffTime`,
+  which the release does not ship): saved, wiped, restored executable and
+  working, and the operator's `MOD_PARAMETERS_SETS` — which lists it — restored
+  with it.
 - ☐ The same path driven by a real `.tgz` install (the rehearsal called
   `tedge-persist` directly rather than going through ICR-OS's own upgrade).

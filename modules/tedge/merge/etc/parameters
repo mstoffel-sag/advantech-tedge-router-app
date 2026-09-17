@@ -37,9 +37,10 @@ MOD_PARAMETERS_ENABLED=1
 #               params.toml (named flow_params_<mapper>_<flow>). Listing it
 #               costs nothing on a router without flows -- it then serves no
 #               sets at all.
-#   relayAutoOffTime
-#               a SCALAR set (a plain number, not a field map): the delay of the
-#               relay-auto-open flow, exposed under the name of the matching
-#               Digital Twin Manager property. Dormant if that flow is not
-#               installed.
-MOD_PARAMETERS_SETS="Metrics Relay Container flow_params relayAutoOffTime"
+# Add your own by dropping an executable of that name into
+# /opt/tedge/parameter-plugins/ and listing it here -- it is then carried across
+# module upgrades like the flows and these config files (see bin/tedge-persist).
+# docs/examples/relayAutoOffTime in the Router App repository is a worked example
+# of a SCALAR set (a plain number rather than a field map), binding one flow
+# parameter to a Digital Twin Manager property of the same name.
+MOD_PARAMETERS_SETS="Metrics Relay Container flow_params"

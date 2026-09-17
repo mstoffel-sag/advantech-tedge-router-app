@@ -16,6 +16,8 @@
 #     from the cloud as configuration types -- an upgrade silently reverted them
 #     to the shipped defaults (e.g. relay polarity back to active-low).
 #   * etc/settings: the Cumulocity connection settings.
+#   * parameter plugins the operator added to parameter-plugins/ -- the whole
+#     point of that directory being an extension point.
 #
 # The store is /opt/tedge-data/persist -- the same partition and the same
 # self-cleaning guard as the device certificate (see etc/install): it survives an
@@ -26,14 +28,18 @@
 # before the tree is replaced) and from etc/init stop, so an interrupted upgrade
 # still has a recent copy. `restore` runs from etc/install.
 #
-# Shipped flows are NOT saved: etc/install records them in mappers/.shipped-flows
-# at install time, and the new version brings its own (they change with the
-# bundled thin-edge.io version, so the shipped copies must win).
+# What the APP ships is never saved: etc/install records the shipped flows and
+# parameter plugins in mappers/.shipped-flows and parameter-plugins/.shipped at
+# install time, and the new version brings its own (they change with the version,
+# so the shipped copies must win). Everything else in those directories belongs
+# to the operator and is carried across.
 set -u
 
 MOD_DIR=/opt/tedge
 PERSIST=/opt/tedge-data/persist
 MANIFEST="$MOD_DIR/mappers/.shipped-flows"
+PLUGIN_DIR="$MOD_DIR/parameter-plugins"
+PLUGIN_MANIFEST="$PLUGIN_DIR/.shipped"
 CONFIGS="metrics relay container parameters settings"
 
 log() { echo "tedge-persist: $1"; }
@@ -50,6 +56,7 @@ persist_id() {       # persistent store
 }
 
 is_shipped() { grep -qx "$1" "$MANIFEST" 2>/dev/null; }
+is_shipped_plugin() { grep -qx "$1" "$PLUGIN_MANIFEST" 2>/dev/null; }
 
 # ICR-OS busybox has no diff and no md5sum/sha*sum -- but it does have cmp.
 same_file() { cmp -s "$1" "$2" 2>/dev/null; }
@@ -69,6 +76,20 @@ save() {
         cp -a "$d" "$PERSIST/flows/${id%/*}/" && n=$((n + 1))
     done
     [ "$n" -gt 0 ] && log "saved $n flow(s) not shipped by this app"
+
+    # Parameter plugins the operator added (the directory is an extension
+    # point; see docs/EXTENSION-API.md Pattern E).
+    rm -rf "$PERSIST/parameter-plugins"
+    n=0
+    for f in "$PLUGIN_DIR"/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        case "$name" in .*) continue ;; esac
+        is_shipped_plugin "$name" && continue
+        mkdir -p "$PERSIST/parameter-plugins"
+        cp -a "$f" "$PERSIST/parameter-plugins/" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "saved $n parameter plugin(s) not shipped by this app"
 
     # Feature configs and the module settings.
     for f in $CONFIGS; do
@@ -97,6 +118,21 @@ restore() {
     done
     [ "$n" -gt 0 ] && log "restored $n flow(s) across the upgrade"
 
+    # Parameter plugins: never clobber one this version ships under the same
+    # name (the shipped one is newer and is what the manifest knows about).
+    n=0
+    for f in "$PERSIST"/parameter-plugins/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        if [ -e "$PLUGIN_DIR/$name" ]; then
+            log "parameter plugin $name is now shipped by this version; keeping the shipped one"
+            continue
+        fi
+        mkdir -p "$PLUGIN_DIR"
+        cp -a "$f" "$PLUGIN_DIR/" && chmod +x "$PLUGIN_DIR/$name" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "restored $n parameter plugin(s) across the upgrade"
+
     # Configs: the operator's file wins, but keep the shipped one alongside as
     # *.dist so new settings introduced by an upgrade are still discoverable.
     for f in $CONFIGS; do
@@ -118,6 +154,9 @@ status() {
             [ -e "$d" ] && echo "  flow:   $(persist_id "$d")"
         done
     fi
+    for f in "$PERSIST"/parameter-plugins/*; do
+        [ -f "$f" ] && echo "  plugin: $(basename "$f")"
+    done
     for f in $CONFIGS; do
         [ -f "$PERSIST/etc/$f" ] && echo "  config: etc/$f"
     done

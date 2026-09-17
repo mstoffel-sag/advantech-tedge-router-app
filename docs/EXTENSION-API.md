@@ -181,15 +181,14 @@ Test it without the cloud:
 /opt/tedge/bin/parameter-update set MyThing '{"threshold":42}'   # full dispatch path
 ```
 
-> A plugin dropped into `/opt/tedge` is **wiped by a module upgrade** (ICR-OS
-> replaces the module tree). Unlike the feature *configs* and installed flows,
-> which `bin/tedge-persist` carries across, plugin scripts are not preserved —
-> the app cannot tell a dropped-in script from one it used to ship. For a
-> throwaway that is fine; anything permanent belongs in the repo at
-> `modules/tedge/merge/parameter-plugins/<Set>`, with its name in the shipped
-> `merge/etc/parameters`, so it is part of the app. An extension module should
-> install its plugin from its own `/opt/<name>` tree in its `install` hook,
-> which an upgrade of *this* module does not touch.
+> ICR-OS replaces the module tree on every upgrade, but a plugin you drop into
+> `/opt/tedge/parameter-plugins/` **survives it**: `bin/tedge-persist` saves
+> everything in that directory that the app does not ship (it knows which is
+> which from the `.shipped` manifest written at install time) and restores it
+> afterwards, along with your `etc/parameters`. If a later release ships a
+> plugin of the same name, the shipped one wins and yours is left in the store.
+> An extension module can instead install its plugin from its own `/opt/<name>`
+> tree in its `install` hook, which an upgrade of this module never touches.
 
 #### The plugin contract
 
@@ -268,9 +267,10 @@ reference implementation:
 - **A scalar set is a legitimate shape.** A DTM property whose schema is a
   number or string sends a bare value, and the dispatcher passes it through
   untouched (upstream's `.operation[<Set>]` already does this).
-  `parameter-plugins/relayAutoOffTime` is the example: it binds one cloud
-  parameter to one device setting under the cloud's own name and accepts either
-  `5` or `{"relayAutoOffTime": 5}`.
+  [`docs/examples/relayAutoOffTime`](examples/relayAutoOffTime) is a worked
+  example — not shipped, because it is specific to one tenant's property and to
+  a flow the app does not ship. It binds one cloud parameter to one flow setting
+  under the cloud's own name and accepts either `5` or `{"relayAutoOffTime": 5}`.
 - **Publish the applied state** (`tedge mqtt pub -r te/device/main///twin/<Set>
   "$(get)"`) at the end of `set`, so the cloud shows what actually landed.
 - **Reload narrowly.** `/opt/tedge/etc/init reload <feature>` restarts a single

@@ -1,5 +1,12 @@
 #!/bin/sh
-# Parameter plugin: relayAutoOffTime (a SCALAR parameter set)
+# EXAMPLE parameter plugin: relayAutoOffTime (a SCALAR parameter set)
+#
+# NOT shipped by the Router App -- it is specific to one tenant's Digital Twin
+# Manager property and to a flow the app does not ship. Copy it to
+# /opt/tedge/parameter-plugins/relayAutoOffTime on a router that has both, add
+# the name to MOD_PARAMETERS_SETS in /opt/tedge/etc/parameters, and it will be
+# carried across module upgrades like any other operator-added plugin
+# (bin/tedge-persist). See docs/EXTENSION-API.md, Pattern E.
 #
 # Binds the Cumulocity parameter `relayAutoOffTime` to the delay of the
 # relay-auto-open flow: how many minutes a relay closed from Cumulocity may stay

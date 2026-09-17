@@ -136,18 +136,19 @@ covers the flows installed on the router:
 | `Relay` | `enabled`, `pollInterval`, `outputs`, `activeLow` | `/opt/tedge/etc/relay` |
 | `Container` | `enabled` | `/opt/tedge/etc/container` |
 | `flow_params_<mapper>_<flow>` | whatever that flow declares | `mappers/<mapper>/flows/<flow>/params.toml` |
-| `relayAutoOffTime` | a bare number: the relay-auto-open flow's delay | that flow's `delay_minutes` |
 
 `flow_params_*` is a *family*: one set per installed thin-edge flow that has a
 `params.toml`, discovered at runtime (a router without flows simply has none).
 Keys are edited in place, so a flow's documenting comments survive an update —
 unlike upstream, which regenerates the file.
 
-`relayAutoOffTime` is a **scalar** set — the matching Digital Twin Manager
-property is a plain `number`, so the operation carries a bare value rather than
-a field map. It is the worked example of binding one cloud parameter to one
-device setting under the cloud's own name; it lies dormant if that flow is not
-installed.
+A **scalar** set is also possible, where the Digital Twin Manager property is a
+plain `number` or `string` and the operation carries a bare value rather than a
+field map. [`docs/examples/relayAutoOffTime`](docs/examples/relayAutoOffTime) is
+a worked example, deliberately *not* shipped: it binds one cloud parameter to one
+flow setting under the cloud's own name, which makes it specific to a tenant's
+property and to a flow the app does not ship. Copy it onto a router that has
+both — it is then carried across upgrades like any operator-added plugin.
 
 How it works: `operations/parameter_update.toml` is a thin-edge workflow, so
 `tedge-agent` publishes the `parameter_update` capability and the c8y mapper
@@ -356,7 +357,7 @@ the operator's own artifacts across the wipe an ICR-OS module upgrade performs �
 the cloud-editable feature configs (`etc/{metrics,relay,container,parameters}`),
 `etc/settings`, and **every flow the app does not ship** (a flow installed from
 Cumulocity's Software tab lives inside `/opt/tedge/mappers/` and was previously
-destroyed by an upgrade). They are saved to `/opt/tedge-data/persist` by
+destroyed by an upgrade), plus any parameter plugin you added. They are saved to `/opt/tedge-data/persist` by
 `etc/uninstall` (which ICR-OS runs on an upgrade) and by `etc/init stop`, and
 restored by `etc/install`; where the new version ships a different config file,
 yours wins and the shipped one is kept alongside as `<file>.dist`. Inspect the
