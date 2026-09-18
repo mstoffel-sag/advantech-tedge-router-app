@@ -1,6 +1,56 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.0.17
+------
+* The Cumulocity tenant and the device ID can now be CHANGED, not just set once.
+  Both are entered on the configuration page as before -- what is new is that a
+  change to either actually re-provisions the router.
+    - Why it did not work: thin-edge takes the device id from the device
+      CERTIFICATE's CN, and with c8y-ca that certificate is signed by ONE
+      tenant's CA. Our certificate store is persistent (it has to survive a
+      module upgrade, see 1.0.3), so the first identity was permanent: a new
+      MOD_TEDGE_DEVICE_ID was ignored (1.0.6 fixed that one case), and a new
+      MOD_TEDGE_C8Y_URL left the router presenting a certificate the new tenant
+      had never signed -- the bridge failed the TLS handshake on every connect
+      and the device was silently offline, with nothing in the web UI saying why.
+    - etc/init now records the (tenant, device id) its certificate was
+      provisioned for in /opt/tedge-data/identity and reconciles it on every
+      start (apply_identity). A change archives the old certificate under
+      device-certs/archive/<tenant>__<id> -- it is never deleted -- and
+      provisions the new identity.
+    - Switching back restores the archived certificate instead of registering
+      again, so a tenant move can be undone. The archive is searched by what the
+      certificates say (CN = device id, issuer = tenant), not only by the
+      directory key, so it is found even when the tenant is entered under
+      another of its host names.
+    - A URL change that only respells the SAME tenant (mytenant.cumulocity.com
+      vs t12345.cumulocity.com) is recognised from the certificate's issuer and
+      keeps the certificate: no needless re-registration.
+    - self-signed mode keeps its certificate across a tenant change (it is not
+      bound to a tenant) and only asks for it to be uploaded to the new one; in
+      basic mode tenant and id come from the device user, so nothing is dropped.
+* bin/tedge-register: new. Obtains the certificate from the Cumulocity CA and,
+  when the device has not been registered in the tenant yet, keeps retrying in
+  the background and runs `tedge reconnect c8y` the moment the registration
+  appears. That is exactly the state a tenant change leaves the router in -- the
+  operator registers it in the NEW tenant after pointing it there -- and until
+  now the single attempt at start simply failed and someone had to restart the
+  module by hand. Knobs: MOD_TEDGE_REGISTER_INTERVAL / _TIMEOUT. Runnable by
+  hand over SSH; its log is registered as the cloud log type "tedge-register".
+* While no certificate exists in a certificate mode, the Cumulocity mapper is no
+  longer started: it could only exit with "Could not access
+  .../tedge-certificate.pem" on every attempt. The first-connect heal loop skips
+  its 90 s watch for the same reason.
+* `etc/init identity` (new) and the Status page of the web interface show which
+  identity is in effect: configured tenant/id, active tenant/id, the
+  certificate's subject, issuer and validity, a pending registration and the
+  archived identities. This is the first thing to look at when a device does not
+  appear in the tenant the operator expects.
+* Documented on the configuration page, in etc/defaults and in the README what a
+  tenant or ID change means -- including that the device left behind in the old
+  tenant is not deleted.
+
 1.0.16
 ------
 * Device parameters: Cumulocity's c8y_ParameterUpdate feature is now supported,

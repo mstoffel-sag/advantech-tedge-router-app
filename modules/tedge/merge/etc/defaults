@@ -9,6 +9,14 @@ MOD_TEDGE_ENABLED=0
 
 # Cumulocity IoT tenant URL, WITHOUT the https:// prefix.
 # Example: mytenant.cumulocity.com
+#
+# Changing it MOVES the router to another tenant. The device certificate is
+# issued by one tenant's CA, so with MOD_TEDGE_CA=c8y-ca the old certificate is
+# archived and the device registers again in the new tenant (register it there
+# first, or the router waits for the registration to appear and connects then).
+# Switching back restores the archived certificate -- no second registration.
+# The device object in the old tenant is left untouched; delete it there if the
+# router is not coming back.
 MOD_TEDGE_C8Y_URL=
 
 # Registration / authentication mode:
@@ -20,13 +28,30 @@ MOD_TEDGE_C8Y_URL=
 #               with "tedge cert upload c8y --user <c8y-user>".
 MOD_TEDGE_CA=c8y-ca
 
-# Device external ID (the identifier shown in Cumulocity). Leave empty to derive
-# it automatically from the router (tedge-identity / hostname).
+# Device external ID (the identifier shown in Cumulocity, and the device name).
+# Leave empty to keep the id of the current certificate, or -- on a router that
+# has none yet -- to derive one from the router (tedge-identity / hostname).
+#
+# Changing it makes this router a DIFFERENT device in Cumulocity: the id is the
+# certificate's Common Name, so a new certificate is issued for the new id
+# (register it in the tenant first, or the router waits for that registration).
+# The old device object stays in the tenant with its history; this one starts
+# empty. Changing the id back restores the archived certificate.
 MOD_TEDGE_DEVICE_ID=
 
-# One-time password for c8y-ca registration. Leave empty to auto-derive a value
-# from the device ID (the same value is printed to the log for registration).
+# One-time password for c8y-ca registration -- the one entered in Cumulocity's
+# device registration. A new one is needed whenever the device has to register
+# again (a new tenant, or a new device ID). The md5(device-id) fallback of
+# thin-edge's bootstrap does not work here: ICR-OS ships no md5sum.
 MOD_TEDGE_OTP=
+
+# Optional, advanced: how the pending-registration watcher (bin/tedge-register,
+# started when the tenant has no registration for this device yet) retries --
+# seconds between attempts, and how long to keep trying (0 = forever).
+# Note that saving the form in the web interface rewrites this file with the
+# settings it knows, so re-add these two if you set them.
+#MOD_TEDGE_REGISTER_INTERVAL=30
+#MOD_TEDGE_REGISTER_TIMEOUT=3600
 
 # Basic-auth credentials (only used when MOD_TEDGE_CA=basic).
 # The device ID is derived from the username (part after "/", minus "device_").

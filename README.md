@@ -83,7 +83,9 @@ The module adds a page under **Customization → Router Apps → thin-edge.io** 
   to Cumulocity's trusted certificates (for `self-signed` mode). Enter a
   Cumulocity user and password; the page runs `tedge cert upload c8y` and shows
   the result. The credentials are used only for the upload and are not stored.
-- **Status** — the live daemon status and the most recent Cumulocity mapper log.
+- **Status** — the live daemon status, the **Cumulocity identity actually in
+  effect** (configured tenant and device ID vs. what the device certificate says,
+  plus any pending registration) and the most recent Cumulocity mapper log.
 - **System Log** — the router's system log, filtered to this module.
 
 The page is a single compiled CGI (`source/module_cgi.c`) built against the
@@ -303,7 +305,7 @@ You can also edit `/opt/tedge/etc/settings` over SSH and run
 
 | `MOD_TEDGE_CA` | How it authenticates |
 |----------------|----------------------|
-| `c8y-ca`       | Downloads a device certificate from the Cumulocity Certificate Authority using a one-time password. The registration URL (with the OTP) is printed to the log; the OTP defaults to `md5(device-id)` if not set. **Recommended.** |
+| `c8y-ca`       | Downloads a device certificate from the Cumulocity Certificate Authority using the one-time password from `MOD_TEDGE_OTP` (set it — thin-edge's `md5(device-id)` default needs `md5sum`, which ICR-OS does not ship). The registration URL is logged, the password is not. If the device is not registered yet, the app keeps retrying in the background and connects as soon as it is. **Recommended.** |
 | `basic`        | Uses a device username + password (`MOD_TEDGE_DEVICE_USER` / `MOD_TEDGE_DEVICE_PASSWORD`). |
 | `self-signed`  | Creates a self-signed device certificate on the router. Upload it to Cumulocity from the **Upload Certificate** page (or with `tedge cert upload c8y --user <c8y-user>` over SSH). |
 
@@ -325,11 +327,65 @@ What that means in practice:
 | **Upgrade** (install a newer app over the existing one) | `/opt/tedge` is replaced but `/opt/tedge-data` is kept — the device reuses its certificate and reconnects as the **same device**. No re-registration. |
 | **Delete**, then **reboot** | A self-cleaning guard removes `/opt/tedge-data` (certificate **and** key) on the first boot after the app is gone — deleting it too. The app's footprint is then fully removed. |
 | **Delete, then reinstall without rebooting** | The certificate is still present, so the reinstalled app reuses it — same device, no re-registration. |
-| **Change the device ID** (`MOD_TEDGE_DEVICE_ID` set to a new value) | The app detects the mismatch with the stored certificate, discards it, and registers again under the new ID. **The new ID must first be registered in Cumulocity.** |
+| **Change the device ID** (`MOD_TEDGE_DEVICE_ID` set to a new value) | The app detects the mismatch with the stored certificate, archives it, and registers again under the new ID — see below. |
+| **Change the tenant** (`MOD_TEDGE_C8Y_URL` set to another tenant) | Same: the certificate of the old tenant is archived and the device registers in the new one — see below. |
 
 > Because the wipe-on-delete happens on the **next boot** (the only hook that
 > runs once the module is gone), the certificate remains on disk between deleting
 > the app and rebooting. Reboot the router to complete removal.
+
+### Moving the router to another tenant, or renaming it
+
+Change **Cumulocity URL** and/or **Device ID** on the configuration page and press
+Apply — that is the whole procedure. What the app does with it:
+
+1. It remembers which `(tenant, device ID)` the certificate on the router was
+   issued for (`/opt/tedge-data/identity`). A start that finds either one changed
+   is a **re-provisioning**, not an ordinary restart.
+2. The old certificate is **archived** (`/opt/tedge-data/device-certs/archive/`),
+   never deleted.
+3. If the router has been that identity before, the archived certificate is
+   restored and it reconnects immediately — **switching back needs no second
+   registration**. The archive is searched by what the certificates themselves
+   say (CN = device ID, issuer = tenant), so it also hits when the tenant is
+   entered under another of its host names.
+4. Otherwise the device registers with the Cumulocity CA. Register the device ID
+   in the target tenant with a one-time password and enter that password in the
+   form; **the order does not matter** — `bin/tedge-register` keeps retrying in
+   the background and connects within seconds of the registration appearing
+   (progress in `/var/log/tedge/tedge-register.log`, also retrievable from
+   Cumulocity as log type `tedge-register`). The Cumulocity mapper is not started
+   while no certificate exists, so the log stays free of TLS failures.
+
+A URL change that only *respells* the same tenant (`mytenant.cumulocity.com` vs.
+`t12345.cumulocity.com`) is recognised from the certificate's issuer and keeps
+the certificate — the router does not re-register.
+
+In the other two registration modes there is less to do: `basic` carries tenant
+and ID in the device user, and a `self-signed` certificate is not bound to a
+tenant — after a tenant change, upload it to the new one (**Upload Certificate**).
+
+What the app does **not** do is touch the cloud: the device it leaves behind in
+the old tenant (or under the old ID) keeps existing, with its history. Delete it
+there yourself if the router is not coming back.
+
+Check what is actually in effect at any time:
+
+```sh
+/opt/tedge/etc/init identity     # also on the web UI's Status page
+```
+
+```
+  Configured tenant:  mytenant.eu-latest.cumulocity.com
+  Configured id:      router-42
+  Registration mode:  c8y-ca
+  Active tenant:      mytenant.eu-latest.cumulocity.com
+  Active device id:   router-42
+  Cert Subject: CN=router-42, O=Thin Edge, OU=Device
+  Cert Issuer: O=mytenant.eu-latest.cumulocity.com, CN=t12345
+  Cert Status: VALID (expires in: 308d 4h 14m 12s)
+  Archived identity:  router-07 @ othertenant.eu-latest.cumulocity.com
+```
 
 ## Operating
 
@@ -338,8 +394,10 @@ Over SSH (the app also symlinks `tedge` onto the system `PATH`):
 ```sh
 . /opt/tedge/env
 
-/opt/tedge/etc/init status      # daemon status
+/opt/tedge/etc/init status      # daemon status + the active Cumulocity identity
+/opt/tedge/etc/init identity    # just the identity (tenant, device ID, certificate)
 /opt/tedge/etc/init restart     # apply settings changes
+/opt/tedge/bin/tedge-register   # retry the Cumulocity CA registration now
 /opt/tedge/etc/init reload metrics    # restart one feature only
                                 # (metrics|relay|container|parameters)
 tedge config list               # show effective configuration

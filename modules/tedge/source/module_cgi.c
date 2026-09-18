@@ -9,7 +9,8 @@
 //   set.cgi    - validate + save settings, then run "etc/init restart"
 //   cert.cgi   - render the "upload self-signed certificate to Cumulocity" form
 //   certup.cgi - run "etc/init upload-cert" (tedge cert upload c8y) + show output
-//   status.cgi - show daemon status and the recent mapper log
+//   status.cgi - show daemon status, the active Cumulocity identity and the
+//                recent mapper log
 //   slog.cgi   - the standard system-log viewer, filtered to this module
 
 #define _GNU_SOURCE
@@ -112,11 +113,24 @@ static void main_index(void)
   um_html_table(1, 0);
 
   um_html_text("URL without the https:// prefix, e.g. mytenant.cumulocity.com. "
-               "Leave the Device ID empty to derive it from the router. "
-               "The one-time password (Cumulocity CA mode) defaults to md5(device id). "
+               "Leave the Device ID empty to keep the identity the router already has. "
                "The device user and password are used only in Basic auth mode. "
                "In Self-signed mode, the service creates a device certificate on the "
                "router; use the Upload Certificate page to upload it to Cumulocity.");
+
+  um_html_form_break();
+
+  um_html_table(1, 0);
+
+  um_html_text("Changing the URL moves the router to another tenant, and changing the "
+               "Device ID makes it a different device there. In Cumulocity CA mode both "
+               "need a new registration: register the Device ID in the tenant (with a "
+               "one-time password entered above) and the router connects as soon as that "
+               "registration exists - it keeps retrying in the background, so the order "
+               "does not matter. The previous certificate is archived, so switching back "
+               "reconnects the router as the device it was before. The device left behind "
+               "in the old tenant is not deleted. The Status page shows which tenant and "
+               "device ID are currently in effect.");
 
   um_html_form_break();
 
@@ -278,6 +292,12 @@ static void main_status(void)
 
   um_html_pre_head("Daemon status");
   um_html_pre_proc(MODULE_INIT " status 2>&1", true);
+
+  // What the settings ask for vs. what the device certificate actually says --
+  // the first thing to look at when a device does not show up in the expected
+  // tenant, or still carries its old ID (see etc/init, show_identity).
+  um_html_pre_head("Cumulocity identity");
+  um_html_pre_proc(MODULE_INIT " identity 2>&1", true);
 
   um_html_pre_head("Recent Cumulocity mapper log");
   um_html_pre_proc("tail -n 40 /var/log/tedge/tedge-mapper-c8y.log 2>/dev/null", true);
