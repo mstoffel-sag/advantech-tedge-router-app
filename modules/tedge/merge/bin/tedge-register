@@ -1,0 +1,149 @@
+#!/bin/sh
+# tedge-register -- obtain this router's device certificate from the Cumulocity
+# Certificate Authority (registration mode c8y-ca).
+#
+#   tedge-register once     one attempt; what etc/init runs while starting
+#   tedge-register watch    keep trying in the background until the device has
+#                           been registered in the tenant, then connect
+#   tedge-register          same as `once` -- for running it by hand over SSH
+#
+# WHY THIS IS NOT JUST A LINE IN etc/init: registering is not a step the device
+# can complete on its own. A human creates the registration in Cumulocity, and
+# with a tenant change (or a new device id) they do it AFTER the router has been
+# pointed at the new tenant -- the router asks first and is refused, because the
+# new tenant has never heard of it. A single attempt at start therefore fails on
+# exactly the workflow the operator is in the middle of, and the device stayed
+# offline until someone restarted the module by hand. `watch` closes that gap:
+# it retries, and on success runs the same `tedge reconnect c8y` that etc/init
+# uses, so the device comes online by itself minutes after the registration is
+# created.
+#
+# Knobs (etc/settings): MOD_TEDGE_REGISTER_INTERVAL (seconds between attempts),
+# MOD_TEDGE_REGISTER_TIMEOUT (seconds to keep trying, 0 = forever).
+set -u
+[ -f /opt/tedge/env ] && . /opt/tedge/env
+
+MOD_DIR=/opt/tedge
+SETTINGS=$MOD_DIR/etc/settings
+[ -f "$SETTINGS" ] || SETTINGS=$MOD_DIR/etc/defaults
+# shellcheck disable=SC1090
+[ -f "$SETTINGS" ] && . "$SETTINGS"
+
+MOD_TEDGE_DEVICE_ID=${MOD_TEDGE_DEVICE_ID:-}
+MOD_TEDGE_OTP=${MOD_TEDGE_OTP:-}
+INTERVAL=${MOD_TEDGE_REGISTER_INTERVAL:-30}
+TIMEOUT=${MOD_TEDGE_REGISTER_TIMEOUT:-3600}
+
+log() { /usr/bin/logger -t tedge-register "$1" 2>/dev/null; echo "$(date '+%F %T') $1"; }
+
+cert_path() { tedge config get device.cert_path 2>/dev/null; }
+have_cert() { c=$(cert_path); [ -n "$c" ] && [ -f "$c" ]; }
+
+DEV_ID=$MOD_TEDGE_DEVICE_ID
+[ -n "$DEV_ID" ] || DEV_ID=$(tedge config get device.id 2>/dev/null)
+C8Y_URL=$(tedge config get c8y.url 2>/dev/null)
+
+# The one-time password. thin-edge's own bootstrap defaults it to md5(device id)
+# -- this firmware's busybox has no md5sum (nor sha*sum/cksum), where that
+# silently produced an EMPTY password and every attempt failed with no hint why.
+OTP=$MOD_TEDGE_OTP
+if [ -z "$OTP" ] && type md5sum >/dev/null 2>&1; then
+    OTP=$(printf "%s" "$DEV_ID" | md5sum | awk '{print $1}')
+fi
+
+# Never log the one-time password: log() writes to syslog (/var/log/messages),
+# which is itself retrievable from the cloud through the log plugin.
+registration_hint() {
+    log "Register this device in Cumulocity (external id: $DEV_ID):"
+    log "  https://$C8Y_URL/apps/devicemanagement/index.html#/deviceregistration?externalId=$DEV_ID"
+    log "  Use the one-time password from the module settings (MOD_TEDGE_OTP); it is not logged."
+}
+
+# One download attempt. $1 = how long tedge itself may keep retrying.
+attempt() {   # attempt <max-timeout-seconds>
+    out=$(tedge cert download c8y --device-id "$DEV_ID" \
+              --one-time-password "$OTP" --retry-every 5s --max-timeout "$1s" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    # Keep the last non-empty line -- that is where tedge puts the cause
+    # ("No newDeviceRequest found for this ID", a wrong password, no network).
+    REASON=$(echo "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+    return 1
+}
+
+connect() {
+    if tedge reconnect c8y >/dev/null 2>&1; then
+        log "Connected to $C8Y_URL as '$DEV_ID'"
+    else
+        log "Certificate obtained but 'tedge reconnect c8y' failed; the mapper retries"
+    fi
+}
+
+precheck() {
+    if have_cert; then
+        log "A device certificate is already present ($(cert_path)); nothing to do"
+        exit 0
+    fi
+    if [ -z "$C8Y_URL" ]; then
+        log "ERROR: no Cumulocity URL configured (MOD_TEDGE_C8Y_URL)"
+        exit 1
+    fi
+    if [ -z "$DEV_ID" ]; then
+        log "ERROR: no device id -- set MOD_TEDGE_DEVICE_ID in the module settings"
+        exit 1
+    fi
+    if [ -z "$OTP" ]; then
+        log "ERROR: no one-time password and md5sum is not available on this firmware;"
+        log "       set MOD_TEDGE_OTP to the password you entered in Cumulocity."
+        exit 1
+    fi
+}
+
+case "${1:-once}" in
+    once)
+        precheck
+        registration_hint
+        if attempt 60; then
+            connect
+            exit 0
+        fi
+        log "Not registered yet: $REASON"
+        exit 1
+        ;;
+    watch)
+        precheck
+        log "Waiting for '$DEV_ID' to be registered in $C8Y_URL (every ${INTERVAL}s)"
+        waited=0
+        while :; do
+            sleep "$INTERVAL"
+            waited=$((waited + INTERVAL))
+            # Someone may have provisioned a certificate in the meantime
+            # (a restart, a manual run) -- then this watcher is redundant.
+            if have_cert; then
+                log "A device certificate appeared; stopping the registration watch"
+                exit 0
+            fi
+            if attempt 20; then
+                log "Registration completed after ${waited}s"
+                connect
+                exit 0
+            fi
+            # The first failure always (an operator looking at the log right
+            # after the switch must see WHY), then one line per ~5 minutes so a
+            # router waiting overnight for someone to register it does not fill
+            # /var/log (a tmpfs on ICR-OS).
+            if [ "$waited" -le "$INTERVAL" ] || [ "$((waited % 300))" -lt "$INTERVAL" ]; then
+                log "Still waiting to be registered in $C8Y_URL as '$DEV_ID': $REASON"
+            fi
+            if [ "$TIMEOUT" -gt 0 ] && [ "$waited" -ge "$TIMEOUT" ]; then
+                log "Giving up after ${waited}s. Register the device, then restart the module"
+                log "  (or run: /opt/tedge/bin/tedge-register once)"
+                exit 1
+            fi
+        done
+        ;;
+    *)
+        echo "Usage: $0 {once|watch}" >&2
+        exit 1
+        ;;
+esac

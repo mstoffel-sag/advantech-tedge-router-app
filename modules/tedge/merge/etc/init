@@ -37,6 +37,10 @@ MAPPER_LOG="$LOGDIR/tedge-mapper-c8y.log"
 # See docs/SELF-UPDATE-ROLLBACK.md (sec 1).
 PERSIST_DIR=/opt/tedge-data
 CERT_DIR=$PERSIST_DIR/device-certs
+# Certificates of identities this router has used before (see apply_identity).
+CERT_ARCHIVE=$CERT_DIR/archive
+# The (tenant, device id) the current certificate was provisioned for.
+IDENTITY_FILE=$PERSIST_DIR/identity
 
 log() { /usr/bin/logger -t "$MOD_NAME" "$1" 2>/dev/null; echo "$1"; }
 
@@ -92,22 +96,232 @@ anchor_persistent_certs() {
         || tedge config set device.key_path "$CERT_DIR/tedge-private-key.pem"
 }
 
-# thin-edge reads the device id from the certificate's CN, and our persistent
-# cert store survives reinstalls -- so once a device has a cert it keeps that id
-# (and therefore its Cumulocity name) forever, ignoring a newly-entered
-# MOD_TEDGE_DEVICE_ID. If the operator EXPLICITLY sets a device id that differs
-# from the current certificate's CN, treat the cert as stale and remove it so a
-# fresh certificate is issued for the new id (a re-registration). Only triggers
-# on an explicit, changed MOD_TEDGE_DEVICE_ID -- never when the id is derived.
-drop_cert_on_id_change() {
-    [ -n "$MOD_TEDGE_DEVICE_ID" ] || return 0
+# ---------------------------------------------------------------------------
+# Device identity = (Cumulocity tenant URL, device id)
+#
+# thin-edge identifies the device by its CERTIFICATE: the device id is the
+# certificate's Common Name, and with c8y-ca the certificate is signed by ONE
+# tenant's CA (its issuer names that tenant) -- so the certificate is also the
+# tenant binding. Our certificate store is deliberately persistent, because it
+# must survive a module upgrade (see anchor_persistent_certs), and that is
+# exactly what made a device's first identity permanent:
+#
+#   * a newly entered MOD_TEDGE_DEVICE_ID was ignored -- thin-edge kept reading
+#     the id from the old certificate's CN,
+#   * a newly entered MOD_TEDGE_C8Y_URL left the device presenting a certificate
+#     the new tenant's CA never signed. The bridge then fails the TLS handshake
+#     on every connect and the router is silently offline, with nothing in the
+#     web UI saying why.
+#
+# So we remember which (url, id) the certificate on disk was provisioned for and
+# act when the operator changes either: archive that certificate and provision a
+# new one. Archives are kept PER IDENTITY, so moving back to a tenant (or an id)
+# the router has used before restores its certificate instead of needing another
+# registration -- and a switch that turns out to be wrong is undoable.
+# ---------------------------------------------------------------------------
+
+# Directory-safe form of a tenant URL / device id.
+slug() { echo "$1" | sed 's|[^A-Za-z0-9._-]|_|g'; }
+
+archive_dir() { echo "$CERT_ARCHIVE/$(slug "$1")__$(slug "$2")"; }   # <url> <id>
+
+identity_get() {   # identity_get URL|DEVICE_ID
+    [ -f "$IDENTITY_FILE" ] || return 0
+    sed -n "s/^PROVISIONED_$1=//p" "$IDENTITY_FILE"
+}
+
+record_identity() {   # record_identity <url> <device-id>
+    mkdir -p "$PERSIST_DIR" 2>/dev/null || true
+    cat > "$IDENTITY_FILE" <<EOT
+# Written by /opt/tedge/etc/init -- the Cumulocity identity the device
+# certificate in $CERT_DIR was provisioned for. Do not edit; change the
+# settings in the web UI (Customization > Router Apps > thin-edge.io) instead.
+PROVISIONED_URL=$1
+PROVISIONED_DEVICE_ID=$2
+EOT
+}
+
+# Pull one attribute out of an X.509 distinguished name as `tedge cert show`
+# prints it ("O=example.cumulocity.com, CN=t12345").
+dn_attr() {   # dn_attr <dn> <attribute>
+    echo "$1" | awk -v a="$2" -F', *' '{
+        for (i = 1; i <= NF; i++) {
+            n = index($i, "=")
+            if (n && substr($i, 1, n - 1) == a) { print substr($i, n + 1); exit }
+        }
+    }'
+}
+
+# `tedge cert show` reads the device certificate by default and any other one
+# with --cert-path, which is how the archived certificates below are inspected.
+cert_show() {   # cert_show [path]
+    if [ -n "$1" ]; then tedge cert show --cert-path "$1" 2>/dev/null
+    else tedge cert show 2>/dev/null; fi
+}
+cert_issuer()  { cert_show "$1" | sed -n 's/^Issuer:[[:space:]]*//p'; }
+cert_subject() { cert_show "$1" | sed -n 's/^Subject:[[:space:]]*//p'; }
+
+# Does this issuer belong to the tenant that is now configured? A tenant answers
+# to more than one host name (its id and any alias), so a changed URL does not
+# have to mean a changed TENANT -- and re-registering a device that did not need
+# it is the expensive mistake here. Accept it when the issuer names the
+# configured URL, or when the issuer's CN (the tenant id) is the URL's first
+# label (t12345.eu-latest.cumulocity.com <-> CN=t12345).
+issuer_is_tenant() {   # issuer_is_tenant <issuer-dn> <url>
+    [ -n "$1" ] || return 1
+    [ "$(dn_attr "$1" O)" = "$2" ] && return 0
+    icn=$(dn_attr "$1" CN)
+    [ -n "$icn" ] && [ "${2%%.*}" = "$icn" ] && return 0
+    return 1
+}
+
+cert_matches_tenant() { issuer_is_tenant "$(cert_issuer "")" "$1"; }
+
+archive_cert() {   # archive_cert <url> <device-id>
     cp=$(tedge config get device.cert_path 2>/dev/null)
+    kp=$(tedge config get device.key_path 2>/dev/null)
     [ -f "$cp" ] || return 0
-    current=$(tedge config get device.id 2>/dev/null)   # = cert CN while a cert exists
-    if [ -n "$current" ] && [ "$current" != "$MOD_TEDGE_DEVICE_ID" ]; then
-        log "Device id change requested ('$current' -> '$MOD_TEDGE_DEVICE_ID'); removing old certificate to re-register"
-        rm -f "$cp" "$(tedge config get device.key_path 2>/dev/null)"
+    d=$(archive_dir "$1" "$2")
+    mkdir -p "$d" 2>/dev/null || return 0
+    chmod 700 "$CERT_ARCHIVE" "$d" 2>/dev/null || true
+    rm -f "$d/tedge-certificate.pem" "$d/tedge-private-key.pem"
+    cp -p "$cp" "$d/tedge-certificate.pem" 2>/dev/null || return 0
+    [ -f "$kp" ] && cp -p "$kp" "$d/tedge-private-key.pem" 2>/dev/null
+    log "Archived the certificate of '$2' @ ${1:-<no tenant>} in $d"
+}
+
+# The archive is keyed by the URL that was configured when a certificate was
+# archived -- but the operator may well come back under another of the tenant's
+# host names, and after a pending registration there is no certificate on disk
+# left to compare. So when the key does not hit, ask the archived certificates
+# themselves: the right one carries this device id as its CN and was issued by
+# the tenant now configured (a self-signed certificate is issued by the router,
+# not by a tenant, so there the id alone decides).
+find_archived_cert() {   # find_archived_cert <url> <device-id>
+    for d in "$CERT_ARCHIVE"/*; do
+        [ -f "$d/tedge-certificate.pem" ] && [ -f "$d/tedge-private-key.pem" ] || continue
+        [ "$(dn_attr "$(cert_subject "$d/tedge-certificate.pem")" CN)" = "$2" ] || continue
+        if [ "$MOD_TEDGE_CA" != "self-signed" ]; then
+            issuer_is_tenant "$(cert_issuer "$d/tedge-certificate.pem")" "$1" || continue
+        fi
+        echo "$d"
+        return 0
+    done
+    return 1
+}
+
+restore_cert() {   # restore_cert <url> <device-id>; 0 when one was restored
+    d=$(archive_dir "$1" "$2")
+    [ -f "$d/tedge-certificate.pem" ] || d=$(find_archived_cert "$1" "$2")
+    [ -n "$d" ] && [ -f "$d/tedge-certificate.pem" ] && [ -f "$d/tedge-private-key.pem" ] || return 1
+    cp=$(tedge config get device.cert_path 2>/dev/null)
+    kp=$(tedge config get device.key_path 2>/dev/null)
+    [ -n "$cp" ] && [ -n "$kp" ] || return 1
+    rm -f "$cp" "$kp"
+    cp -p "$d/tedge-certificate.pem" "$cp" || return 1
+    cp -p "$d/tedge-private-key.pem" "$kp" || return 1
+    chmod 444 "$cp" 2>/dev/null || true
+    chmod 400 "$kp" 2>/dev/null || true
+    return 0
+}
+
+drop_cert() {
+    rm -f "$(tedge config get device.cert_path 2>/dev/null)" \
+          "$(tedge config get device.key_path 2>/dev/null)"
+}
+
+# React to a changed tenant URL and/or device id. Runs on every start; does
+# nothing at all while both are unchanged.
+apply_identity() {   # apply_identity <url> <device-id>
+    want_url=$1
+    want_id=$2
+    prev_url=$(identity_get URL)
+    prev_id=$(identity_get DEVICE_ID)
+
+    # First start after installing a version that keeps this record (or the very
+    # first start of all): adopt what is on the device rather than reading the
+    # missing record as a change. The certificate's CN wins over the settings --
+    # it is what thin-edge actually uses.
+    if [ ! -f "$IDENTITY_FILE" ]; then
+        have_url=$(tedge config get c8y.url 2>/dev/null)
+        have_id=$(tedge config get device.id 2>/dev/null)
+        record_identity "${have_url:-$want_url}" "${have_id:-$want_id}"
+        prev_url=$(identity_get URL)
+        prev_id=$(identity_get DEVICE_ID)
     fi
+
+    [ "$want_url" = "$prev_url" ] && [ "$want_id" = "$prev_id" ] && return 0
+
+    changed=
+    [ "$want_url" != "$prev_url" ] && changed="tenant '$prev_url' -> '$want_url'"
+    [ "$want_id" != "$prev_id" ] && changed="${changed:+$changed, }device id '$prev_id' -> '$want_id'"
+    log "Cumulocity identity change requested ($changed)"
+
+    case "$MOD_TEDGE_CA" in
+        basic)
+            # No certificate is involved: the device user in the settings carries
+            # both the tenant and the id.
+            record_identity "$want_url" "$want_id"
+            return 0
+            ;;
+        self-signed)
+            # A self-signed certificate is not bound to a tenant, only to the id
+            # (its CN), so a tenant change keeps it -- it just has to be uploaded
+            # to the new tenant. An id change needs a new certificate.
+            if [ "$want_id" != "$prev_id" ]; then
+                archive_cert "$prev_url" "$prev_id"
+                if restore_cert "$want_url" "$want_id"; then
+                    log "Restored the certificate previously created for '$want_id'"
+                else
+                    drop_cert
+                    log "Removed the certificate of '$prev_id'; a new one is created for '$want_id'"
+                fi
+            fi
+            if [ "$want_url" != "$prev_url" ]; then
+                log "Tenant changed: upload the device certificate to $want_url"
+                log "  web UI: Upload Certificate -- or: tedge cert upload c8y --user <c8y-user>"
+            fi
+            record_identity "$want_url" "$want_id"
+            return 0
+            ;;
+    esac
+
+    # c8y-ca: the certificate is bound to the tenant (issuer) AND the id (CN).
+    if [ "$want_id" = "$prev_id" ] && cert_matches_tenant "$want_url"; then
+        log "The URL changed but the certificate was issued by that same tenant ($(cert_issuer "")); keeping it"
+        record_identity "$want_url" "$want_id"
+        return 0
+    fi
+
+    archive_cert "$prev_url" "$prev_id"
+    if restore_cert "$want_url" "$want_id"; then
+        log "Restored the certificate previously issued for '$want_id' @ $want_url"
+    else
+        drop_cert
+        log "Registering '$want_id' with $want_url (the old certificate is archived)"
+        log "  The new device must be registered in that tenant -- see the registration URL below."
+    fi
+    record_identity "$want_url" "$want_id"
+}
+
+# The device id the settings ask for. With no explicit MOD_TEDGE_DEVICE_ID the
+# id must stay whatever the certificate says (thin-edge reads it from the CN):
+# deriving one from the hostname here would look like an id change on every
+# start and re-register the device.
+desired_device_id() {
+    if [ -n "$MOD_TEDGE_DEVICE_ID" ]; then
+        echo "$MOD_TEDGE_DEVICE_ID"
+        return 0
+    fi
+    if [ "$MOD_TEDGE_CA" = "basic" ]; then
+        echo "$MOD_TEDGE_DEVICE_USER" | cut -d/ -f2- | sed 's|^device_||'
+        return 0
+    fi
+    if [ -f "$(tedge config get device.cert_path 2>/dev/null)" ]; then
+        tedge config get device.id 2>/dev/null
+        return 0
+    fi
+    resolve_device_id
 }
 
 configure() {
@@ -115,12 +329,15 @@ configure() {
     # checks below, so an upgraded device finds its cert and skips re-download).
     anchor_persistent_certs
 
-    # Honour an explicit device-id change by dropping a now-stale certificate.
-    drop_cert_on_id_change
+    url=$(normalize_url "$MOD_TEDGE_C8Y_URL")
+    dev_id=$(desired_device_id)
+
+    # Honour a changed tenant and/or device id: archive the certificate of the
+    # old identity and provision (or restore) one for the new one.
+    apply_identity "$url" "$dev_id"
 
     # Cumulocity URL
-    if [ -n "$MOD_TEDGE_C8Y_URL" ]; then
-        url=$(normalize_url "$MOD_TEDGE_C8Y_URL")
+    if [ -n "$url" ]; then
         [ "$(tedge config get c8y.url 2>/dev/null)" = "$url" ] || tedge config set c8y.url "$url"
     fi
 
@@ -135,7 +352,8 @@ password = "$MOD_TEDGE_DEVICE_PASSWORD"
 EOT
                 chmod 600 "$cred_path" 2>/dev/null || true
                 tedge config set c8y.auth_method basic
-                dev_id=$(echo "$MOD_TEDGE_DEVICE_USER" | cut -d/ -f2- | sed 's|^device_||')
+                # The id follows the device user, not MOD_TEDGE_DEVICE_ID
+                # (desired_device_id derives it the same way).
                 [ -n "$dev_id" ] && tedge config set device.id "$dev_id"
             else
                 log "ERROR: MOD_TEDGE_CA=basic but device user/password are not set"
@@ -145,7 +363,6 @@ EOT
         self-signed)
             tedge config set c8y.auth_method certificate
             cert_path=$(tedge config get device.cert_path 2>/dev/null)
-            dev_id=$(resolve_device_id)
             [ -n "$dev_id" ] && tedge config set device.id "$dev_id"
             if [ ! -f "$cert_path" ]; then
                 tedge cert create --device-id "$dev_id" || return 1
@@ -155,38 +372,21 @@ EOT
             ;;
         *)  # c8y-ca (Cumulocity Certificate Authority) -- default & recommended
             tedge config set c8y.auth_method certificate
-            dev_id=$(resolve_device_id)
             [ -n "$dev_id" ] && tedge config set device.id "$dev_id"
             cert_path=$(tedge config get device.cert_path 2>/dev/null)
             if [ ! -f "$cert_path" ]; then
-                otp=$MOD_TEDGE_OTP
-                # Fall back to the documented md5-of-device-id -- but only if a
-                # digest tool exists. This firmware's busybox has no md5sum (nor
-                # sha*sum/cksum), where this silently produced an EMPTY one-time
-                # password and every registration attempt failed with no hint why.
-                if [ -z "$otp" ]; then
-                    if type md5sum >/dev/null 2>&1; then
-                        otp=$(printf "%s" "$dev_id" | md5sum | awk '{print $1}')
-                    else
-                        log "ERROR: no one-time password set and md5sum is not available on this firmware;"
-                        log "       set MOD_TEDGE_OTP in the module settings to the password you entered in Cumulocity."
-                    fi
+                # Getting the certificate is bin/tedge-register's job: one
+                # attempt now, and if the device is not registered in the tenant
+                # yet -- the normal state right after a tenant change, because
+                # the operator registers it in the NEW tenant once the router
+                # asks for it -- a background watcher that keeps trying and
+                # connects the moment the registration appears. Before that the
+                # device stayed offline until someone restarted the module.
+                if "$BIN/tedge-register" once; then
+                    log "Device certificate obtained from the Cumulocity CA"
+                else
+                    start_register
                 fi
-                c8y_host=$(tedge config get c8y.url 2>/dev/null)
-                if [ -n "$c8y_host" ]; then
-                    # Do NOT log the one-time password: log() writes to syslog
-                    # (/var/log/messages), which is itself retrievable from the
-                    # cloud via the log plugin. Log the external id only and tell
-                    # the operator where the OTP comes from.
-                    log "Register this device in Cumulocity (external id: $dev_id):"
-                    log "  https://$c8y_host/apps/devicemanagement/index.html#/deviceregistration?externalId=$dev_id"
-                    log "  Enter the one-time password from MOD_TEDGE_OTP (default: md5 of the device id); it is not logged."
-                fi
-                # Non-fatal: if the device is not registered / no network yet,
-                # this simply retries on the next start.
-                tedge cert download c8y --device-id "$dev_id" \
-                    --one-time-password "$otp" --retry-every 5s --max-timeout 60s \
-                    || log "Certificate not obtained yet (will retry on next start)"
             fi
             ;;
     esac
@@ -194,6 +394,29 @@ EOT
     # Keep bridge / config in sync (best effort).
     tedge config upgrade  >/dev/null 2>&1 || true
     tedge refresh-bridges >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Pending-registration watcher (c8y-ca only)
+#
+# bin/tedge-register asks the Cumulocity CA for the device certificate until the
+# device has been registered in the tenant, then connects. It exits on its own
+# (on success, or after MOD_TEDGE_REGISTER_TIMEOUT), so nothing has to babysit
+# it -- but stop/restart kills it so a restart never leaves two watchers behind.
+# ---------------------------------------------------------------------------
+register_running() { pidof tedge-register >/dev/null 2>&1; }
+
+stop_register() {
+    register_running || return 0
+    kill $(pidof tedge-register) 2>/dev/null
+}
+
+start_register() {
+    [ -x "$BIN/tedge-register" ] || return 0
+    stop_register
+    "$BIN/tedge-register" watch >> "$LOGDIR/tedge-register.log" 2>&1 &
+    log "Waiting for this device to be registered in Cumulocity; retrying in the background"
+    log "  progress: $LOGDIR/tedge-register.log"
 }
 
 # Work around a Cumulocity c8y-ca first-connect race. On a freshly
@@ -208,6 +431,9 @@ EOT
 # the refusal. Healthy connections return quickly; this only adds latency (and
 # restarts) on a genuinely racing first boot.
 heal_mapper_subscriptions() {
+    # Nothing to heal (and nothing to wait for) when the mapper is not running --
+    # e.g. while the device is waiting to be registered in a new tenant.
+    "$SVC_DIR/S99tedge-mapper-c8y" status >/dev/null 2>&1 || return 0
     max_restarts=3
     restarts=0
     mark=$(wc -l < "$MAPPER_LOG" 2>/dev/null || echo 0)
@@ -445,7 +671,16 @@ start_tedge() {
     # starts the mapper -- so Cumulocity does not auto-register the device as
     # "MQTT Device <id>". Idempotent via reconnect. If it fails (no network / not
     # yet registered), start the mapper directly so we still run and retry.
-    if tedge reconnect c8y >/dev/null 2>&1; then
+    #
+    # In the certificate modes the mapper cannot even build its TLS config
+    # without a device certificate -- it exits immediately with "Could not
+    # access .../tedge-certificate.pem". While a registration is still pending
+    # (a new tenant or a new device id) that is the EXPECTED state, so say so
+    # once instead of starting a daemon that cannot run; bin/tedge-register
+    # connects as soon as the certificate arrives.
+    if [ "$MOD_TEDGE_CA" != "basic" ] && [ ! -f "$(tedge config get device.cert_path 2>/dev/null)" ]; then
+        log "No device certificate yet; the Cumulocity mapper starts once this device is registered"
+    elif tedge reconnect c8y >/dev/null 2>&1; then
         log "connected to Cumulocity (device created/verified by tedge connect)"
     else
         log "tedge connect c8y failed; starting mapper directly (will retry next boot)"
@@ -480,6 +715,7 @@ stop_tedge() {
     # current (bin/tedge-persist). etc/uninstall does this too; doing it on every
     # stop means an upgrade that skips uninstall still finds a recent copy.
     [ -x "$BIN/tedge-persist" ] && "$BIN/tedge-persist" save >/dev/null 2>&1
+    stop_register
     stop_parameters
     stop_container
     stop_relay
@@ -487,6 +723,44 @@ stop_tedge() {
     svc stop tedge-agent
     svc stop tedge-mapper-c8y
     svc stop mosquitto
+}
+
+# ---------------------------------------------------------------------------
+# Which identity is this router actually using? (web UI: Status page)
+#
+# Two things can disagree here, and which one wins is the first question when a
+# device does not appear in the tenant the operator expects: what the SETTINGS
+# ask for, and what the CERTIFICATE on the device says -- thin-edge goes by the
+# certificate (device id = its CN, and with c8y-ca its issuer is the tenant that
+# signed it). apply_identity reconciles the two at every start; until a new
+# certificate has been issued, the two lines below simply differ.
+# ---------------------------------------------------------------------------
+show_identity() {
+    echo "  Configured tenant:  ${MOD_TEDGE_C8Y_URL:-<not set>}"
+    echo "  Configured id:      ${MOD_TEDGE_DEVICE_ID:-<derived from the device>}"
+    echo "  Registration mode:  ${MOD_TEDGE_CA:-c8y-ca}"
+    echo "  Active tenant:      $(tedge config get c8y.url 2>/dev/null)"
+    echo "  Active device id:   $(tedge config get device.id 2>/dev/null)"
+
+    cert_path=$(tedge config get device.cert_path 2>/dev/null)
+    if [ -f "$cert_path" ]; then
+        tedge cert show 2>/dev/null \
+            | grep -E '^(Subject|Issuer|Status|Valid until):' \
+            | sed 's/^\([A-Za-z ]*\):[[:space:]]*/  Cert \1: /'
+    elif [ "$MOD_TEDGE_CA" = "basic" ]; then
+        echo "  Certificate:        not used in basic-auth mode"
+    else
+        echo "  Certificate:        none yet -- the device is not registered in $(tedge config get c8y.url 2>/dev/null) yet"
+    fi
+
+    if register_running; then
+        echo "  Registration:       pending, retrying in the background ($LOGDIR/tedge-register.log)"
+    fi
+
+    for d in "$CERT_ARCHIVE"/*; do
+        [ -d "$d" ] || continue
+        echo "  Archived identity:  $(basename "$d" | sed 's/^\(.*\)__\([^_]*\)$/\2 @ \1/')"
+    done
 }
 
 status_tedge() {
@@ -563,7 +837,14 @@ case "$1" in
     status)
         echo "Module $MOD_NAME:"
         status_tedge
-        exit $?
+        rc=$?
+        echo "Cumulocity identity:"
+        show_identity
+        exit $rc
+        ;;
+    identity)
+        # Just the identity part of `status` (used by the web UI).
+        show_identity
         ;;
     upload-cert)
         # Upload the router's self-signed device certificate to Cumulocity's
@@ -603,7 +884,7 @@ case "$1" in
         echo "Settings reset to defaults"
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|reload <feature>|status|upload-cert|defaults}"
+        echo "Usage: $0 {start|stop|restart|reload <feature>|status|identity|upload-cert|defaults}"
         exit 1
         ;;
 esac

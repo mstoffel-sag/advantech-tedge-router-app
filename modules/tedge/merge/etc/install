@@ -137,6 +137,9 @@ if [ -x "$MOD_DIR/bin/tedge-log-register" ]; then
     "$R" add tedge-mosquitto    "/var/log/tedge/mosquitto.log"     mosquitto     || true
     "$R" add tedge-agent        "/var/log/tedge/tedge-agent.log"   tedge-agent   || true
     "$R" add tedge-mapper       "/var/log/tedge/tedge-mapper-c8y.log" tedge-mapper || true
+    # bin/tedge-register: why a device that was pointed at a new tenant (or given
+    # a new id) is not online yet. Only written while a registration is pending.
+    "$R" add tedge-register     "/var/log/tedge/tedge-register.log" tedge-register || true
 fi
 
 # System metrics: the built-in poller (bin/metrics-monitor, started by etc/init
