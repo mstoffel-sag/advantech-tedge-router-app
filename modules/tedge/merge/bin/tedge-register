@@ -65,9 +65,17 @@ attempt() {   # attempt <max-timeout-seconds>
               --one-time-password "$OTP" --retry-every 5s --max-timeout "$1s" 2>&1)
     rc=$?
     [ "$rc" -eq 0 ] && return 0
-    # Keep the last non-empty line -- that is where tedge puts the cause
-    # ("No newDeviceRequest found for this ID", a wrong password, no network).
-    REASON=$(echo "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+    # WHICH line is the cause matters. tedge prints the server's answer on every
+    # retry as "error: ..." and then ends with a generic "Maximum timeout
+    # elapsed. No certificate has been downloaded" -- the last line, and useless:
+    # it reads as "not registered yet" whatever went wrong. Report the last real
+    # error instead. That is the difference between a tenant with no CA keypair
+    # (404 Failed to retrieve tenant keypair -- creating the device registration
+    # will not help, the tenant's certificate authority has to be enabled first)
+    # and an id that simply has no registration yet (401 No newDeviceRequest
+    # found for this ID), which cost an operator a real debugging session.
+    REASON=$(echo "$out" | grep '^error:' | tail -n 1 | sed 's/^error:[[:space:]]*//')
+    [ -n "$REASON" ] || REASON=$(echo "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
     return 1
 }
 

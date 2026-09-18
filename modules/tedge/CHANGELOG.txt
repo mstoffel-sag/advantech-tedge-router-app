@@ -1,6 +1,24 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.0.18
+------
+* bin/tedge-register reports the reason the Cumulocity CA actually gave, not the
+  last line tedge printed. `tedge cert download` answers each retry with the
+  server's response and then ends with a generic "Maximum timeout elapsed. No
+  certificate has been downloaded" -- which is what was logged, and it reads as
+  "this device is not registered yet" whatever went wrong. Found the hard way
+  migrating a router to a fresh tenant: the tenant had no certificate authority
+  keypair and the server said so on every attempt
+  ("404 Not Found: Failed to retrieve tenant keypair"), while the log sent the
+  operator off to create a device registration that could never have helped.
+  The last "error:" line is now reported, which separates a tenant whose CA is
+  not enabled (404) from an id that simply has no registration yet
+  (401 "No newDeviceRequest found for this ID").
+* docs/ON-DEVICE-VALIDATION-IDENTITY.md records the first real migration with
+  1.0.17 (upgrade + reboot, then tenant AND device id changed in one step,
+  connected 30 s after the target tenant's CA was created).
+
 1.0.17
 ------
 * The Cumulocity tenant and the device ID can now be CHANGED, not just set once.
