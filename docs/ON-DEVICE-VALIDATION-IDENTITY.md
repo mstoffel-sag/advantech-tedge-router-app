@@ -48,10 +48,7 @@ Legend: ✔ verified on device, ☐ still open.
   per start, and `heal_mapper_subscriptions` then watched a dead log for 90 s.
 - ✔ `tedge-register watch` logs its first failure immediately and then only
   every ~5 min (`/var/log/tedge` is a tmpfs).
-- ☐ The watcher's **success** path against a real registration (it exits, runs
-  `tedge reconnect c8y`, the device comes online without a restart) — needs a
-  device registration created in a tenant by hand; only the retry loop and its
-  failure reporting were exercised here.
+- ✔ The watcher's **success** path, in a real migration (see §7).
 
 ## 4. Switching back restores the archived certificate
 
@@ -74,7 +71,47 @@ Legend: ✔ verified on device, ☐ still open.
   agent, metrics poller, relay monitor, container monitor and the parameter
   seeder all back up (`etc/init status`).
 
-## 6. Not covered here
+## 6. A real migration: mstoffel.eu-latest → an SAP-hosted tenant (2026-09-18)
+
+The whole feature, end to end, on a router upgraded to 1.0.17 through its own
+module update and rebooted first.
+
+- ✔ The **upgrade** carried settings, flows, certificate and the identity record
+  through the wipe and a cold boot: `1.0.17`, still online as `advante` @
+  `mstoffel.eu-latest`, no re-registration. An upgrade does not look like an
+  identity change.
+- ✔ Tenant **and** device id changed in one Apply
+  (`mstoffel.eu-latest.cumulocity.com` / `advante` →
+  `tfa20a25d-….eu20.cy.iot.sap` / `advantec-gateway`): old certificate archived,
+  mapper not started, watcher retrying every 30 s.
+- ✔ The operator enabled the tenant's certificate authority; **30 s later** the
+  watcher downloaded the certificate and connected — no restart, no manual step
+  on the router:
+
+  ```
+  11:24:40 Registration completed after 30s
+  11:24:49 Connected to tfa20a25d-….eu20.cy.iot.sap as 'advantec-gateway'
+  ```
+
+  Certificate issued by the new tenant (`Issuer: O=tfa20a25d-….eu20.cy.iot.sap,
+  CN=t889587`), JWT token received, all daemons up.
+
+**Finding — the reported failure reason was the wrong line.** The tenant had no
+CA keypair, and the server said so on every retry
+(`404 Not Found: Failed to retrieve tenant keypair`), but `tedge` ends its output
+with a generic `Maximum timeout elapsed. No certificate has been downloaded`,
+which is what `tedge-register` reported. That reads as "the device is not
+registered yet" and sent the operator to create a device registration, which
+could never have helped. `attempt()` now reports the last `error:` line instead,
+so the log distinguishes a tenant with no CA (404, enable the CA first) from an
+id with no registration (401 `No newDeviceRequest found for this ID`). Verified
+on device against a live 401 (busybox grep/sed).
+
+**Note for diagnosis:** running `tedge cert download c8y --device-id <other>` by
+hand does **not** disturb a working certificate or key — verified while the
+router was connected; both files keep their original timestamps.
+
+## 7. Not covered here
 
 - ☐ `basic` and `self-signed` modes across a tenant change (code paths are
   distinct but were not exercised on hardware).
