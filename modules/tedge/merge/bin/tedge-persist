@@ -1,230 +1,328 @@
 #!/bin/sh
-# tedge-persist -- carry the operator's own artifacts across a Router App upgrade.
+# tedge-persist -- carry everything the OPERATOR owns across a Router App upgrade.
 #
-#   tedge-persist save      # copy them out of the module tree (before it is replaced)
-#   tedge-persist restore   # copy them back (after the new tree is in place)
-#   tedge-persist status    # show what is currently held
+#   tedge-persist baseline      record what this version ships (install, pristine tree)
+#   tedge-persist baseline-add  record what the app itself created during install
+#   tedge-persist save          persist every file that is new or changed since then
+#   tedge-persist restore       put those files back (install, after `baseline`)
+#   tedge-persist status        show what is held
 #
 # WHY: ICR-OS replaces /opt/<module> wholesale on every upgrade. Everything the
-# app ships comes back -- but everything the *operator* added or changed inside
-# that tree is destroyed, and nothing in the platform noticed. That includes:
+# app ships comes back -- everything the operator added or changed inside that
+# tree is destroyed, and nothing in the platform notices.
 #
-#   * flows installed from Cumulocity (Software tab, type `flow`), which the
-#     flows plugin unpacks into mappers/<mapper>/flows/<name>/ -- inside the
-#     module tree. Install a flow from the cloud, upgrade the app, flow gone.
-#   * the feature configs etc/{metrics,relay,container,parameters}, editable
-#     from the cloud as configuration types -- an upgrade silently reverted them
-#     to the shipped defaults (e.g. relay polarity back to active-low).
-#   * etc/settings: the Cumulocity connection settings.
-#   * parameter plugins the operator added to parameter-plugins/ -- the whole
-#     point of that directory being an extension point.
+# WHY A DIFF AND NOT A LIST: this script used to carry a hand-maintained list of
+# files, and the list is what failed. It named etc/{metrics,relay,container,
+# parameters,settings} and the operator's flows, and silently missed
+# plugins/tedge-configuration-plugin.toml -- the file that decides what
+# Cumulocity may read and write at all. The upgrade LOOKED healthy (the bundle
+# ships base entries and etc/install re-adds the app's own), while every entry
+# the operator had added was gone. Looking for that one file turned up three
+# more in the same hole, one of them mappers/c8y/mapper.toml, where thin-edge
+# 2.x actually keeps the cloud connection. A list only ever covers the files
+# somebody remembered, and nothing tells you when it has fallen behind.
+#
+# So the app records, at install time, a BASELINE of what it ships, and `save`
+# persists every file in the configuration surface that is missing from the
+# baseline (the operator added it) or differs from it (the operator changed it).
+# Nothing has to be enumerated in advance: a file a future version introduces is
+# covered the day it exists, as is a file the operator drops in.
+#
+# It also makes carrying app plumbing safe. system.toml and env are in the
+# surface, but an untouched copy is identical to the baseline and is therefore
+# NOT carried -- so a fix this app ships in them is never frozen at the version
+# the router was first installed with. Only a file you actually edited follows
+# you, and where this version ships something different it is kept beside yours
+# as <file>.dist.
 #
 # The store is /opt/tedge-data/persist -- the same partition and the same
-# self-cleaning guard as the device certificate (see etc/install): it survives an
-# upgrade because it is outside the module tree, and is removed on a genuine
+# self-cleaning guard as the device certificate (see etc/install): it survives
+# an upgrade because it is outside the module tree, and is removed on a genuine
 # delete by /opt/tedge-data/etc/init.
 #
 # `save` runs from etc/uninstall (which ICR-OS also runs on an upgrade, right
 # before the tree is replaced) and from etc/init stop, so an interrupted upgrade
-# still has a recent copy. `restore` runs from etc/install.
-#
-# What the APP ships is never saved: etc/install records the shipped flows and
-# parameter plugins in mappers/.shipped-flows and parameter-plugins/.shipped at
-# install time, and the new version brings its own (they change with the version,
-# so the shipped copies must win). Everything else in those directories belongs
-# to the operator and is carried across.
+# still has a recent copy. `baseline`, `restore` and `baseline-add` run from
+# etc/install, in that order.
 set -u
 
 MOD_DIR=/opt/tedge
 PERSIST=/opt/tedge-data/persist
-MANIFEST="$MOD_DIR/mappers/.shipped-flows"
-PLUGIN_DIR="$MOD_DIR/parameter-plugins"
-PLUGIN_MANIFEST="$PLUGIN_DIR/.shipped"
-CONFIGS="metrics relay container parameters settings"
+STORE=$PERSIST/files          # the operator's files, keyed by path relative to MOD_DIR
+BASE=$PERSIST/baseline        # what the installed version ships, same layout
+TMPL=/tmp/.tedge-persist.$$   # scratch file lists
 
-# Cloud-editable files that live INSIDE the module tree, relative to MOD_DIR.
-# Same problem as etc/*, different directory -- and they were missed:
-#
-#   * plugins/tedge-configuration-plugin.toml lists every file Cumulocity may
-#     snapshot/update. The bundle ships four base entries and etc/install re-adds
-#     the app's own with tedge-config-register, so an upgrade LOOKED fine -- but
-#     every entry the operator had added was gone, silently.
-#   * plugins/tedge-log-plugin.toml is the same story for log types, and it is
-#     itself editable from the cloud (config type "tedge-log-plugin").
-#   * plugins/tedge-container-plugin.toml (filters, metrics interval, shared
-#     network) is advertised as cloud-editable in the README, and an upgrade
-#     reverted it to the shipped defaults.
-#   * tedge.toml holds everything the operator set with `tedge config set`.
-#     etc/init re-derives device.id and the certificate paths from the module
-#     settings on every start, but nothing else survived.
-#   * mappers/c8y/mapper.toml is where thin-edge 2.x actually keeps the cloud
-#     connection (url, auth_method, credentials_path) -- NOT tedge.toml, which
-#     is what one would assume. etc/init rewrites url and auth method at every
-#     start, so the device came back online and the loss stayed invisible.
-#
-# Restore runs BEFORE etc/install's tedge-config-register / tedge-log-register
-# calls, and those are idempotent (marker-delimited blocks), so the operator's
-# file comes back and this version's own entries are refreshed on top of it.
-#
-# Deliberately NOT carried: system.toml and env (pure app plumbing -- carrying
-# them would freeze this app's service wiring at the version the router was
-# first installed with) and ca-certificates.crt (carrying it would pin an
-# outdated root store).
-TREE_CONFIGS="plugins/tedge-configuration-plugin.toml plugins/tedge-log-plugin.toml plugins/tedge-container-plugin.toml tedge.toml mappers/c8y/mapper.toml"
+# The configuration surface: where operator-owned content can legitimately live.
+# Deliberately NOT included: bin/, www/, services/, services-init.d/ (app code --
+# a modified copy is a local patch, not configuration, and carrying it across an
+# upgrade would defeat the upgrade), ca-certificates.crt (would pin an outdated
+# root store), and the runtime/state entries (.agent/, mosquitto.db,
+# mosquitto-conf/, device/, credentials.toml -- all regenerated, and the last
+# two hold secrets that etc/settings already carries).
+SURFACE_DIRS="etc plugins operations mappers parameter-plugins sm-plugins log-plugins config-plugins diag-plugins bootstrap.d"
+SURFACE_FILES="tedge.toml system.toml env"
 
 log() { echo "tedge-persist: $1"; }
 
-# The two layouts differ in depth, so each has its own id helper:
-#   module tree:      <MOD_DIR>/mappers/<mapper>/flows/<name>
-#   persistent store: <PERSIST>/flows/<mapper>/<name>
-# Both yield "<mapper>/<name>".
-flow_id() {          # module tree
-    echo "$(basename "$(dirname "$(dirname "$1")")")/$(basename "$1")"
-}
-persist_id() {       # persistent store
-    echo "$(basename "$(dirname "$1")")/$(basename "$1")"
-}
+# `[ -e ]` FOLLOWS symlinks, so a link whose target does not exist (yet) tests
+# as absent -- which made sm-plugins/container look operator-added on every save.
+# Ask about the entry itself.
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
 
-is_shipped() { grep -qx "$1" "$MANIFEST" 2>/dev/null; }
-is_shipped_plugin() { grep -qx "$1" "$PLUGIN_MANIFEST" 2>/dev/null; }
+cleanup() { rm -f "$TMPL" "$TMPL.raw"; }
+trap cleanup EXIT
 
 # ICR-OS busybox has no diff and no md5sum/sha*sum -- but it does have cmp.
-same_file() { cmp -s "$1" "$2" 2>/dev/null; }
+# Symlinks are compared by target, since cmp would follow them (sm-plugins/ is a
+# directory of symlinks, and the mapper symlinks operations/c8y/<op> to a
+# .template).
+same_file() {
+    if [ -L "$1" ] || [ -L "$2" ]; then
+        [ "$(readlink "$1" 2>/dev/null)" = "$(readlink "$2" 2>/dev/null)" ]
+    else
+        cmp -s "$1" "$2" 2>/dev/null
+    fi
+}
 
-save() {
-    mkdir -p "$PERSIST/etc" 2>/dev/null || true
-    chmod 700 "$PERSIST" 2>/dev/null || true
+# Paths this script must never carry, relative to MOD_DIR.
+excluded() {
+    case "$1" in
+        *.dist|*.tmp|*.tmp.*|*.bak|*.bak-*|*~) return 0 ;;
+        .*|*/.*)                               return 0 ;;   # dot files and dot dirs
+    esac
+    # The mapper GENERATES its built-in flows as flat *.toml files under
+    # mappers/<mapper>/flows/ at runtime (alarms.toml, units.toml, ...). They are
+    # not in the package, so they would look operator-added forever, and a stale
+    # copy would mask what a new version generates. A flow installed from
+    # Cumulocity is a DIRECTORY there -- that one is the operator's, and is kept.
+    case "$1" in
+        mappers/*/flows/*)
+            rest=${1#mappers/*/flows/}
+            case "$rest" in
+                */*) return 1 ;;
+                *)   return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
 
-    # Flows: mirror, so a flow the operator deleted does not come back.
-    #
-    # Only DIRECTORIES count. The flows plugin installs every flow as a
-    # directory (mappers/<mapper>/flows/<name>/), whereas the mapper's built-in
-    # flows are flat <name>.toml files it regenerates at runtime -- they are not
-    # in the package at all, which is why the .shipped-flows manifest recorded
-    # at install time is empty on a fresh install and cannot be relied on alone.
-    rm -rf "$PERSIST/flows"
-    n=0
-    for d in "$MOD_DIR"/mappers/*/flows/*; do
-        [ -d "$d" ] || continue
-        id=$(flow_id "$d")
-        is_shipped "$id" && continue
-        mkdir -p "$PERSIST/flows/${id%/*}"
-        cp -a "$d" "$PERSIST/flows/${id%/*}/" && n=$((n + 1))
+# List the surface of <root> into $TMPL, as paths relative to <root>.
+# Two finds rather than one with -o: busybox takes both and this needs no
+# parenthesis quoting.
+surface_of() {   # surface_of <root>
+    root=$1
+    : > "$TMPL"
+    : > "$TMPL.raw"
+    for d in $SURFACE_DIRS; do
+        [ -d "$root/$d" ] || continue
+        find "$root/$d" -type f >> "$TMPL.raw" 2>/dev/null
+        find "$root/$d" -type l >> "$TMPL.raw" 2>/dev/null
     done
-    [ "$n" -gt 0 ] && log "saved $n flow(s) not shipped by this app"
-
-    # Parameter plugins the operator added (the directory is an extension
-    # point; see docs/EXTENSION-API.md Pattern E).
-    rm -rf "$PERSIST/parameter-plugins"
-    n=0
-    for f in "$PLUGIN_DIR"/*; do
-        [ -f "$f" ] || continue
-        name=$(basename "$f")
-        case "$name" in .*) continue ;; esac
-        is_shipped_plugin "$name" && continue
-        mkdir -p "$PERSIST/parameter-plugins"
-        cp -a "$f" "$PERSIST/parameter-plugins/" && n=$((n + 1))
+    for f in $SURFACE_FILES; do
+        exists "$root/$f" && echo "$root/$f" >> "$TMPL.raw"
     done
-    [ "$n" -gt 0 ] && log "saved $n parameter plugin(s) not shipped by this app"
-
-    # Feature configs and the module settings.
-    for f in $CONFIGS; do
-        [ -f "$MOD_DIR/etc/$f" ] || continue
-        cp -a "$MOD_DIR/etc/$f" "$PERSIST/etc/$f"
-    done
-    chmod 600 "$PERSIST/etc/settings" 2>/dev/null || true
-
-    # Cloud-editable files inside the module tree (keeping their relative path).
-    for rel in $TREE_CONFIGS; do
-        [ -f "$MOD_DIR/$rel" ] || continue
-        mkdir -p "$PERSIST/tree/$(dirname "$rel")" 2>/dev/null || continue
-        cp -a "$MOD_DIR/$rel" "$PERSIST/tree/$rel"
-    done
+    while read -r p; do
+        rel=${p#"$root"/}
+        excluded "$rel" || echo "$rel" >> "$TMPL"
+    done < "$TMPL.raw"
+    rm -f "$TMPL.raw"
     return 0
 }
 
-restore() {
-    [ -d "$PERSIST" ] || return 0
+copy_into() {   # copy_into <src-root> <dest-root> <relpath>
+    mkdir -p "$2/$(dirname "$3")" 2>/dev/null || return 1
+    cp -a "$1/$3" "$2/$3" 2>/dev/null
+}
 
-    # Flows: never clobber one the new version ships under the same name.
+count_files() {   # count_files <dir>
+    [ -d "$1" ] || { echo 0; return 0; }
+    { find "$1" -type f; find "$1" -type l; } 2>/dev/null | wc -l
+}
+
+# ---------------------------------------------------------------------------
+# baseline -- what this version ships. Taken on a pristine tree (etc/install
+# runs it before restoring anything), so it is the reference `save` compares to.
+# ---------------------------------------------------------------------------
+baseline() {
+    mkdir -p "$PERSIST" 2>/dev/null || true
+    chmod 700 "$PERSIST" 2>/dev/null || true
+    surface_of "$MOD_DIR"
+    rm -rf "$BASE.new"
+    mkdir -p "$BASE.new" 2>/dev/null || return 1
+    while read -r rel; do
+        copy_into "$MOD_DIR" "$BASE.new" "$rel"
+    done < "$TMPL"
+    rm -rf "$BASE"
+    mv "$BASE.new" "$BASE" || return 1
+    log "recorded $(count_files "$BASE") shipped file(s) as this version's baseline"
+}
+
+# baseline-add -- files the APP creates after the baseline is taken: the
+# sm-plugin symlinks, the entries etc/install registers in the plugin TOMLs.
+# Without this they would look operator-added at the next save. A file that came
+# out of the store belongs to the operator and is never adopted here.
+baseline_add() {
+    [ -d "$BASE" ] || return 0
+    surface_of "$MOD_DIR"
     n=0
-    for d in "$PERSIST"/flows/*/*; do
-        [ -e "$d" ] || continue
-        id=$(persist_id "$d")
-        dest="$MOD_DIR/mappers/${id%/*}/flows/${id#*/}"
-        if [ -e "$dest" ]; then
-            log "flow ${id} is already present; leaving it alone"
-            continue
+    while read -r rel; do
+        exists "$BASE/$rel" && continue
+        exists "$STORE/$rel" && continue
+        copy_into "$MOD_DIR" "$BASE" "$rel" && n=$((n + 1))
+    done < "$TMPL"
+    [ "$n" -gt 0 ] && log "adopted $n file(s) created during install into the baseline"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# save -- everything in the surface that is new or changed since the baseline.
+# ---------------------------------------------------------------------------
+save() {
+    mkdir -p "$PERSIST" 2>/dev/null || true
+    chmod 700 "$PERSIST" 2>/dev/null || true
+
+    if [ ! -d "$BASE" ]; then
+        # This tree was installed by a version that recorded no baseline
+        # (<= 1.0.19). Fall back to that version's fixed list: treating the whole
+        # tree as operator content and restoring it over a new version would
+        # freeze the entire configuration surface.
+        log "no baseline recorded; falling back to the known list"
+        save_legacy
+        return 0
+    fi
+
+    surface_of "$MOD_DIR"
+    rm -rf "$STORE.new"
+    mkdir -p "$STORE.new" 2>/dev/null || return 1
+    n=0
+    while read -r rel; do
+        if exists "$BASE/$rel" && same_file "$BASE/$rel" "$MOD_DIR/$rel"; then
+            continue                      # untouched -- this version ships it
         fi
-        mkdir -p "$(dirname "$dest")"
-        cp -a "$d" "$(dirname "$dest")/" && n=$((n + 1))
-    done
-    [ "$n" -gt 0 ] && log "restored $n flow(s) across the upgrade"
+        copy_into "$MOD_DIR" "$STORE.new" "$rel" && n=$((n + 1))
+    done < "$TMPL"
+    # Mirror, so a file the operator has since reverted or deleted does not come
+    # back from an older save.
+    rm -rf "$STORE"
+    mv "$STORE.new" "$STORE" 2>/dev/null || mkdir -p "$STORE"
+    chmod 600 "$STORE/etc/settings" 2>/dev/null || true
+    log "saved $n file(s) you added or changed"
+}
 
-    # Parameter plugins: never clobber one this version ships under the same
-    # name (the shipped one is newer and is what the manifest knows about).
+# The <= 1.0.19 list, kept only for the no-baseline case above.
+save_legacy() {
+    rm -rf "$STORE.new"
+    mkdir -p "$STORE.new" 2>/dev/null || return 1
     n=0
-    for f in "$PERSIST"/parameter-plugins/*; do
+    for rel in etc/metrics etc/relay etc/container etc/parameters etc/settings \
+               plugins/tedge-configuration-plugin.toml plugins/tedge-log-plugin.toml \
+               plugins/tedge-container-plugin.toml tedge.toml mappers/c8y/mapper.toml; do
+        exists "$MOD_DIR/$rel" || continue
+        copy_into "$MOD_DIR" "$STORE.new" "$rel" && n=$((n + 1))
+    done
+    for d in "$MOD_DIR"/mappers/*/flows/*; do
+        [ -d "$d" ] || continue
+        mapper=$(basename "$(dirname "$(dirname "$d")")")
+        mkdir -p "$STORE.new/mappers/$mapper/flows" 2>/dev/null || continue
+        cp -a "$d" "$STORE.new/mappers/$mapper/flows/" 2>/dev/null && n=$((n + 1))
+    done
+    for f in "$MOD_DIR"/parameter-plugins/*; do
         [ -f "$f" ] || continue
-        name=$(basename "$f")
-        if [ -e "$PLUGIN_DIR/$name" ]; then
-            log "parameter plugin $name is now shipped by this version; keeping the shipped one"
-            continue
-        fi
-        mkdir -p "$PLUGIN_DIR"
-        cp -a "$f" "$PLUGIN_DIR/" && chmod +x "$PLUGIN_DIR/$name" && n=$((n + 1))
+        case "$(basename "$f")" in .*) continue ;; esac
+        copy_into "$MOD_DIR" "$STORE.new" "parameter-plugins/$(basename "$f")" && n=$((n + 1))
     done
-    [ "$n" -gt 0 ] && log "restored $n parameter plugin(s) across the upgrade"
+    rm -rf "$STORE"
+    mv "$STORE.new" "$STORE" 2>/dev/null || mkdir -p "$STORE"
+    chmod 600 "$STORE/etc/settings" 2>/dev/null || true
+    log "saved $n file(s) (legacy list)"
+}
 
-    # Configs: the operator's file wins, but keep the shipped one alongside as
-    # *.dist so new settings introduced by an upgrade are still discoverable.
-    for f in $CONFIGS; do
-        [ -f "$PERSIST/etc/$f" ] || continue
-        if [ -f "$MOD_DIR/etc/$f" ] && ! same_file "$PERSIST/etc/$f" "$MOD_DIR/etc/$f"; then
-            cp -a "$MOD_DIR/etc/$f" "$MOD_DIR/etc/$f.dist"
-            log "kept your etc/$f (this version ships etc/$f.dist)"
-        fi
-        cp -a "$PERSIST/etc/$f" "$MOD_DIR/etc/$f"
-    done
-    chmod 600 "$MOD_DIR/etc/settings" 2>/dev/null || true
-
-    # Same rule for the in-tree files: yours wins, the shipped one is kept
-    # alongside as *.dist so entries a new version introduces stay discoverable.
-    for rel in $TREE_CONFIGS; do
-        [ -f "$PERSIST/tree/$rel" ] || continue
-        mkdir -p "$MOD_DIR/$(dirname "$rel")" 2>/dev/null || true
-        if [ -f "$MOD_DIR/$rel" ] && ! same_file "$PERSIST/tree/$rel" "$MOD_DIR/$rel"; then
-            cp -a "$MOD_DIR/$rel" "$MOD_DIR/$rel.dist"
+# ---------------------------------------------------------------------------
+# restore -- put the operator's files back into the fresh tree. Yours wins;
+# where this version ships something different at the same path, it is kept
+# alongside as <file>.dist so what changed stays discoverable.
+# ---------------------------------------------------------------------------
+restore() {
+    migrate_legacy_store
+    [ -d "$STORE" ] || return 0
+    : > "$TMPL.raw"
+    find "$STORE" -type f >> "$TMPL.raw" 2>/dev/null
+    find "$STORE" -type l >> "$TMPL.raw" 2>/dev/null
+    n=0
+    while read -r p; do
+        rel=${p#"$STORE"/}
+        dest=$MOD_DIR/$rel
+        if exists "$dest" && ! same_file "$p" "$dest"; then
+            cp -a "$dest" "$dest.dist" 2>/dev/null
             log "kept your $rel (this version ships $rel.dist)"
         fi
-        cp -a "$PERSIST/tree/$rel" "$MOD_DIR/$rel"
+        # Remove first: `cp -a` will not replace an existing symlink in place.
+        rm -f "$dest" 2>/dev/null
+        copy_into "$STORE" "$MOD_DIR" "$rel" && n=$((n + 1))
+    done < "$TMPL.raw"
+    rm -f "$TMPL.raw"
+    chmod 600 "$MOD_DIR/etc/settings" 2>/dev/null || true
+    [ "$n" -gt 0 ] && log "restored $n file(s) across the upgrade"
+    return 0
+}
+
+# A store written by <= 1.0.19 has its own layout: etc/<f>, tree/<rel>,
+# flows/<mapper>/<name>/, parameter-plugins/<f>. Fold it into $STORE once, so an
+# upgrade FROM such a version keeps everything it had saved.
+migrate_legacy_store() {
+    [ -d "$PERSIST/etc" ] || [ -d "$PERSIST/tree" ] || [ -d "$PERSIST/flows" ] \
+        || [ -d "$PERSIST/parameter-plugins" ] || return 0
+    log "migrating the persistent store to the per-path layout"
+    for f in "$PERSIST"/etc/*; do
+        [ -f "$f" ] && copy_into "$PERSIST/etc" "$STORE/etc" "$(basename "$f")"
     done
+    if [ -d "$PERSIST/tree" ]; then
+        : > "$TMPL.raw"
+        find "$PERSIST/tree" -type f >> "$TMPL.raw" 2>/dev/null
+        while read -r p; do
+            copy_into "$PERSIST/tree" "$STORE" "${p#"$PERSIST"/tree/}"
+        done < "$TMPL.raw"
+        rm -f "$TMPL.raw"
+    fi
+    for d in "$PERSIST"/flows/*/*; do
+        [ -d "$d" ] || continue
+        mapper=$(basename "$(dirname "$d")")
+        mkdir -p "$STORE/mappers/$mapper/flows" 2>/dev/null || continue
+        cp -a "$d" "$STORE/mappers/$mapper/flows/" 2>/dev/null || true
+    done
+    for f in "$PERSIST"/parameter-plugins/*; do
+        [ -f "$f" ] && copy_into "$PERSIST/parameter-plugins" "$STORE/parameter-plugins" "$(basename "$f")"
+    done
+    rm -rf "$PERSIST/etc" "$PERSIST/tree" "$PERSIST/flows" "$PERSIST/parameter-plugins"
     return 0
 }
 
 status() {
     echo "persistent store: $PERSIST"
-    if [ -d "$PERSIST/flows" ]; then
-        for d in "$PERSIST"/flows/*/*; do
-            [ -e "$d" ] && echo "  flow:   $(persist_id "$d")"
-        done
+    if [ -d "$STORE" ] && [ "$(count_files "$STORE")" -gt 0 ]; then
+        : > "$TMPL.raw"
+        find "$STORE" -type f >> "$TMPL.raw" 2>/dev/null
+        find "$STORE" -type l >> "$TMPL.raw" 2>/dev/null
+        # No `sort` on this firmware's busybox -- find's order will do.
+        while read -r p; do echo "  yours:    ${p#"$STORE"/}"; done < "$TMPL.raw"
+        rm -f "$TMPL.raw"
+    else
+        echo "  (nothing held yet -- run: tedge-persist save)"
     fi
-    for f in "$PERSIST"/parameter-plugins/*; do
-        [ -f "$f" ] && echo "  plugin: $(basename "$f")"
-    done
-    for f in $CONFIGS; do
-        [ -f "$PERSIST/etc/$f" ] && echo "  config: etc/$f"
-    done
-    for rel in $TREE_CONFIGS; do
-        [ -f "$PERSIST/tree/$rel" ] && echo "  config: $rel"
-    done
-    [ -f "$MANIFEST" ] && echo "  shipped flows recorded: $(wc -l < "$MANIFEST")"
+    if [ -d "$BASE" ]; then
+        echo "  baseline: $(count_files "$BASE") shipped file(s) recorded"
+    else
+        echo "  baseline: none (the legacy list is used on save)"
+    fi
     return 0
 }
 
 case "${1:-}" in
-    save)    save ;;
-    restore) restore ;;
-    status)  status ;;
-    *) echo "usage: tedge-persist {save|restore|status}" >&2; exit 2 ;;
+    baseline)     baseline ;;
+    baseline-add) baseline_add ;;
+    save)         save ;;
+    restore)      restore ;;
+    status)       status ;;
+    *) echo "usage: tedge-persist {baseline|baseline-add|save|restore|status}" >&2; exit 2 ;;
 esac

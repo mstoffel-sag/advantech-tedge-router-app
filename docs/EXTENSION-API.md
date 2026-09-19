@@ -183,9 +183,10 @@ Test it without the cloud:
 
 > ICR-OS replaces the module tree on every upgrade, but a plugin you drop into
 > `/opt/tedge/parameter-plugins/` **survives it**: `bin/tedge-persist` saves
-> everything in that directory that the app does not ship (it knows which is
-> which from the `.shipped` manifest written at install time) and restores it
-> afterwards, along with your `etc/parameters`. If a later release ships a
+> everything in the configuration surface that is new or changed since the
+> baseline it recorded when this version was installed — your plugin is not in
+> that baseline, so it is carried — and restores it afterwards, along with your
+> `etc/parameters`. If a later release ships a
 > plugin of the same name, the shipped one wins and yours is left in the store.
 > An extension module can instead install its plugin from its own `/opt/<name>`
 > tree in its `install` hook, which an upgrade of this module never touches.

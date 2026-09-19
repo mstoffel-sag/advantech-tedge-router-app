@@ -1,6 +1,47 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.1.0
+------
+* bin/tedge-persist no longer carries a hand-maintained LIST of files across an
+  upgrade -- it carries whatever differs from what the app ships. The list is
+  what kept failing: it named etc/{metrics,relay,container,parameters,settings}
+  and the operator's flows, and silently missed the file that decides what
+  Cumulocity may read and write at all (plugins/tedge-configuration-plugin.toml)
+  plus three more found next to it (1.0.19). Nothing told anyone the list had
+  fallen behind; the upgrade looked healthy and the entries were simply gone.
+    - etc/install records a BASELINE of the pristine tree across the
+      configuration surface (etc, plugins, operations, mappers,
+      parameter-plugins, sm-plugins, log-plugins, config-plugins, diag-plugins,
+      bootstrap.d, tedge.toml, system.toml, env), then restores the operator's
+      files, then adopts what install itself created (sm-plugin symlinks, the
+      entries the registration helpers add) so they are not mistaken for the
+      operator's next time.
+    - `save` persists every file in that surface that is missing from the
+      baseline or differs from it. A file a future version introduces is covered
+      the day it exists, and so is a file the operator drops in.
+    - Carrying app plumbing is now safe: an untouched system.toml or env is
+      identical to the baseline and is NOT carried, so a fix shipped in them is
+      never frozen at the version the router was first installed with. Only a
+      file the operator actually edited follows them, with the shipped one kept
+      alongside as <file>.dist.
+    - Excluded by design: bin/, www/, services*/ (app code), ca-certificates.crt
+      (would pin an outdated root store), the mapper's generated flat
+      mappers/*/flows/*.toml (a flow installed from Cumulocity is a directory
+      there and IS carried), and runtime state (mosquitto.db, credentials.toml).
+    - A store written by <= 1.0.19 (etc/, tree/, flows/, parameter-plugins/) is
+      migrated to the per-path layout on the first restore, so upgrading from
+      1.0.19 keeps everything it had saved. If no baseline exists at save time
+      (an older version installed the tree), the 1.0.19 list is used as a
+      fallback rather than treating the whole tree as operator content.
+    - The .shipped-flows / .shipped manifests etc/install used to write are gone;
+      the baseline answers the same question for every file, not just two dirs.
+* Fixed while testing on hardware: `[ -e ]` follows symlinks, so a link whose
+  target does not exist yet (sm-plugins/container during install) tested as
+  absent and was saved as operator content on every upgrade -- and `cp -a` will
+  not replace an existing symlink, so restoring it then failed. Both handled.
+  Also dropped a `sort` from `status`: this firmware's busybox has none.
+
 1.0.19
 ------
 * bin/tedge-persist now carries the cloud-editable files that live in the module

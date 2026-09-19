@@ -411,16 +411,33 @@ Bump `TEDGE_VERSION` in `packages/tedge/Makefile`, update
 `packages/tedge/version.txt` and `modules/tedge/CHANGELOG.txt`, then rebuild.
 Config files are shipped as `*.default` and are **not** overwritten on reinstall,
 so operator settings survive upgrades. Beyond that, `bin/tedge-persist` carries
-the operator's own artifacts across the wipe an ICR-OS module upgrade performs —
-the cloud-editable feature configs (`etc/{metrics,relay,container,parameters}`),
-`etc/settings`, the cloud-editable files inside the module tree
-(`plugins/tedge-{configuration,log,container}-plugin.toml` and `tedge.toml`),
-and **every flow the app does not ship** (a flow installed from
-Cumulocity's Software tab lives inside `/opt/tedge/mappers/` and was previously
-destroyed by an upgrade), plus any parameter plugin you added. They are saved to `/opt/tedge-data/persist` by
-`etc/uninstall` (which ICR-OS runs on an upgrade) and by `etc/init stop`, and
-restored by `etc/install`; where the new version ships a different config file,
-yours wins and the shipped one is kept alongside as `<file>.dist`. Inspect the
+the operator's own artifacts across the wipe an ICR-OS module upgrade performs.
+
+It does that **without a list of files to maintain**. At install time it records
+a *baseline* of what the version ships across the configuration surface —
+`etc/`, `plugins/`, `operations/`, `mappers/`, `parameter-plugins/`,
+`sm-plugins/`, `log-plugins/`, `config-plugins/`, `diag-plugins/`,
+`bootstrap.d/`, plus `tedge.toml`, `system.toml` and `env`. On the way out it
+saves everything in that surface that is **new or differs from the baseline**,
+i.e. exactly what you added or changed, and `etc/install` puts it back. So a
+file a future version introduces is covered the day it exists, and so is a file
+you drop in yourself — the earlier hand-maintained list is what silently lost
+operator entries from `plugins/tedge-configuration-plugin.toml` up to 1.0.19.
+
+The same property makes carrying app plumbing safe: an untouched `system.toml`
+is identical to the baseline, so it is *not* carried and a fix the app ships in
+it is never frozen — only a file you actually edited follows you, and where the
+new version ships something different at that path it is kept beside yours as
+`<file>.dist`.
+
+Not carried, deliberately: `bin/`, `www/`, `services*/` (app code — a modified
+copy is a local patch, not configuration), `ca-certificates.crt` (it would pin
+an outdated root store), the mapper's generated flat `mappers/*/flows/*.toml`
+(regenerated at runtime; a flow you install from Cumulocity is a *directory*
+there and is kept), and runtime state such as `mosquitto.db` or `credentials.toml`.
+
+Saves happen in `etc/uninstall` (which ICR-OS runs on an upgrade) and in
+`etc/init stop`, so an interrupted upgrade still has a recent copy. Inspect the
 store with `/opt/tedge/bin/tedge-persist status`. The device certificate/key also survive
 (see [Device identity, upgrades & removal](#device-identity-upgrades--removal)),
 so upgrading does not re-register the device in Cumulocity.
