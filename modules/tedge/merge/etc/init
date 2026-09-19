@@ -714,6 +714,18 @@ start_tedge() {
     # as this app's own rather than carried forward as if the operator had put
     # it there. See bin/tedge-persist (baseline-seal).
     [ -x "$BIN/tedge-persist" ] && "$BIN/tedge-persist" baseline-seal >/dev/null 2>&1
+
+    # ...and again once the start has SETTLED. Sealing at the end of this
+    # function is too early for some of it: the mapper rewrites
+    # operations/c8y/{c8y_UploadConfigFile,c8y_LogfileRequest,
+    # c8y_DownloadConfigFile} when the agent publishes those capabilities, which
+    # lands after the bridge is up -- observed on the 1.1.2 install, where the
+    # three reappeared in the store one start later. The re-seal is what
+    # actually catches them; the early one keeps the window small if the router
+    # is stopped before this fires.
+    if [ -x "$BIN/tedge-persist" ]; then
+        ( sleep 180; "$BIN/tedge-persist" baseline-reseal ) >/dev/null 2>&1 &
+    fi
 }
 
 stop_tedge() {

@@ -1,6 +1,19 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.1.3
+------
+* The upgrade baseline is sealed AGAIN 3 minutes after a start. Sealing at the
+  end of etc/init's start is too early for part of it: the mapper rewrites
+  operations/c8y/{c8y_UploadConfigFile,c8y_LogfileRequest,c8y_DownloadConfigFile}
+  when the agent publishes those capabilities, which lands after the bridge is
+  up. On the 1.1.2 install of the test router those three were back in the store
+  one start later -- carried across upgrades as if the operator had written
+  them. The early seal stays (it keeps the window small if the router is stopped
+  in between); `tedge-persist baseline-reseal` is the one that catches the rest.
+  Verified on the device: after a restart the re-seal fires by itself and the
+  store holds only the operator's own files.
+
 1.1.2
 ------
 * baseline-seal now RE-RECORDS the files it seals, instead of only adding the
