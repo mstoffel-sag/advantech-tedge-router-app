@@ -189,12 +189,13 @@ baseline_add() {
     return 0
 }
 
-# baseline-seal -- what THIN-EDGE generates the first time it runs: the workflow
+# baseline-seal -- what THIN-EDGE writes the first time it runs: the workflow
 # files it renders from operations/*.toml.template, the built-in operations it
 # writes into operations/c8y/, mappers/<cloud>/mapper.toml, the bridge rules.
-# None of those exist while etc/install is running, so the baseline cannot
-# contain them and every one of them would look operator-added forever -- which
-# on the next upgrade would hand the router last version's plumbing back.
+# Some of those do not exist while etc/install is running (so the baseline cannot
+# contain them) and some it ships and then REWRITES (so the baseline no longer
+# matches). Either way every one of them looks operator-owned, and on the next
+# upgrade that hands the router last version's plumbing back.
 #
 # Done ONCE per install (etc/init calls it at the end of a start; `baseline`
 # clears the seal for the next version), and never for a file that is already in
@@ -206,9 +207,25 @@ baseline_add() {
 baseline_seal() {
     [ -d "$BASE" ] || return 0
     [ -f "$SEAL" ] && return 0
-    baseline_add
+    surface_of "$MOD_DIR"
+    n=0
+    while read -r rel; do
+        # What `restore` put back is the operator's: leave the baseline alone
+        # for those, or the next save would drop them.
+        is_restored "$rel" && continue
+        # Everything else is this app's own, whatever it looks like now -- so
+        # RE-RECORD it, not just add it when missing. thin-edge rewrites files
+        # it also ships (operations/c8y/c8y_SoftwareUpdate and friends,
+        # mappers/<cloud>/mapper.toml) the first time it runs; those are in the
+        # baseline but no longer match it, and without this they would be
+        # carried across every upgrade as if the operator had edited them --
+        # handing the router its old plumbing back.
+        exists "$BASE/$rel" && same_file "$BASE/$rel" "$MOD_DIR/$rel" && continue
+        rm -rf "$BASE/$rel" 2>/dev/null
+        copy_into "$MOD_DIR" "$BASE" "$rel" && n=$((n + 1))
+    done < "$TMPL"
     : > "$SEAL"
-    log "baseline sealed for this version"
+    log "baseline sealed for this version ($n file(s) adopted or refreshed)"
 }
 
 # ---------------------------------------------------------------------------

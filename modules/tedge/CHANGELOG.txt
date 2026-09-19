@@ -1,6 +1,20 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.1.2
+------
+* baseline-seal now RE-RECORDS the files it seals, instead of only adding the
+  ones the baseline was missing. thin-edge does not just generate files on its
+  first run -- it also rewrites files it ships (operations/c8y/c8y_SoftwareUpdate,
+  c8y_LogfileRequest, c8y_UploadConfigFile, c8y_DownloadConfigFile, and
+  mappers/<cloud>/mapper.toml). Those are in the baseline but no longer match it,
+  so 1.1.1 still carried them across every upgrade as if the operator had edited
+  them -- the router would have got its old plumbing back after all. Seen on the
+  clean 1.1.1 install of the test router: four operations files still counted as
+  changed; with this they drop out and the store holds only the operator's files.
+  What `restore` put back is still never touched, so operator content is
+  unaffected.
+
 1.1.1
 ------
 * bin/tedge-persist: adopt what THIN-EDGE generates on its first run. The 1.1.0
