@@ -1,6 +1,37 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.0.19
+------
+* bin/tedge-persist now carries the cloud-editable files that live in the module
+  tree, not just the ones under etc/. They were missed in 1.0.16 and every
+  upgrade silently reverted them:
+    - plugins/tedge-configuration-plugin.toml -- the list of every file
+      Cumulocity may snapshot/update. An upgrade LOOKED fine (the bundle ships
+      four base entries and etc/install re-adds the app's own with
+      tedge-config-register), but every entry the OPERATOR had added was gone.
+    - plugins/tedge-log-plugin.toml -- same story for log types, and it is
+      itself editable from the cloud.
+    - plugins/tedge-container-plugin.toml -- filters, metrics interval, shared
+      network; the README advertises it as cloud-editable, yet an upgrade reset
+      it to the shipped defaults.
+    - tedge.toml -- everything set with `tedge config set`.
+    - mappers/c8y/mapper.toml -- where thin-edge 2.x actually keeps the cloud
+      connection (url, auth_method, credentials_path), not tedge.toml as one
+      would assume. etc/init rewrites the url and the auth method at every
+      start, so the device came back online and the loss stayed invisible.
+  Same rule as the etc/* files: yours wins and the shipped one is kept
+  alongside as <file>.dist. Restore runs before etc/install's registration
+  helpers, which are idempotent, so this version's own entries are refreshed on
+  top of the restored file. system.toml, env and ca-certificates.crt are
+  deliberately NOT carried (app plumbing / a root store that should not be
+  pinned to the version the router was first installed with).
+* etc/install notes why the config list must NOT be registered as a config type
+  by hand: thin-edge 2.x already exposes it implicitly as
+  "tedge-configuration-plugin", and an explicit [[files]] entry makes the file
+  config plugin abort with "duplicated type" and announce that one type instead
+  of the whole list (found on the device while restoring a lost list).
+
 1.0.18
 ------
 * bin/tedge-register reports the reason the Cumulocity CA actually gave, not the

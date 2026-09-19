@@ -413,7 +413,9 @@ Config files are shipped as `*.default` and are **not** overwritten on reinstall
 so operator settings survive upgrades. Beyond that, `bin/tedge-persist` carries
 the operator's own artifacts across the wipe an ICR-OS module upgrade performs —
 the cloud-editable feature configs (`etc/{metrics,relay,container,parameters}`),
-`etc/settings`, and **every flow the app does not ship** (a flow installed from
+`etc/settings`, the cloud-editable files inside the module tree
+(`plugins/tedge-{configuration,log,container}-plugin.toml` and `tedge.toml`),
+and **every flow the app does not ship** (a flow installed from
 Cumulocity's Software tab lives inside `/opt/tedge/mappers/` and was previously
 destroyed by an upgrade), plus any parameter plugin you added. They are saved to `/opt/tedge-data/persist` by
 `etc/uninstall` (which ICR-OS runs on an upgrade) and by `etc/init stop`, and
