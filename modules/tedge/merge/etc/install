@@ -63,6 +63,13 @@ chmod +x /opt/tedge-data/etc/init 2>/dev/null || true
 # Make sure the bundled scripts are executable.
 chmod +x "$MOD_DIR/bin/"* "$MOD_DIR/etc/init" 2>/dev/null || true
 
+# Record what THIS version ships, while the tree is still pristine -- nothing of
+# the operator's has been put back yet. bin/tedge-persist compares against this
+# baseline to decide what belongs to the operator, which is how the app stopped
+# needing a hand-maintained list of files to carry across an upgrade (and
+# stopped losing the ones nobody had listed).
+[ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" baseline || true
+
 # ---------------------------------------------------------------------------
 # Carry the operator's own artifacts across this upgrade.
 #
@@ -72,34 +79,10 @@ chmod +x "$MOD_DIR/bin/"* "$MOD_DIR/etc/init" 2>/dev/null || true
 # /opt/tedge-data/persist (from etc/uninstall, which runs on an upgrade too, and
 # from etc/init stop); restore them now.
 #
-# First record which flows THIS version ships, so a later save can tell them
-# apart from the operator's. Anything already held in the persistent store is
-# the operator's by definition and is never recorded as shipped -- that keeps a
-# manual re-run of this script from disowning a flow.
-# Only directories are considered: the flows plugin installs a flow as a
-# directory, while the mapper's built-in flows are flat *.toml files it
-# regenerates at runtime (they are not in the package, so this manifest is
-# legitimately empty on a fresh install).
-install -d "$MOD_DIR/mappers" 2>/dev/null || true
-: > "$MOD_DIR/mappers/.shipped-flows"
-for d in "$MOD_DIR"/mappers/*/flows/*; do
-    [ -d "$d" ] || continue
-    fname=$(basename "$d")
-    fmapper=$(basename "$(dirname "$(dirname "$d")")")
-    [ -e "/opt/tedge-data/persist/flows/$fmapper/$fname" ] && continue
-    echo "$fmapper/$fname" >> "$MOD_DIR/mappers/.shipped-flows"
-done
-# Same for the parameter plugins: record what this version ships, so a later
-# save can tell them from the ones the operator dropped in.
-: > "$MOD_DIR/parameter-plugins/.shipped"
-for f in "$MOD_DIR"/parameter-plugins/*; do
-    [ -f "$f" ] || continue
-    pname=$(basename "$f")
-    case "$pname" in .*) continue ;; esac
-    [ -e "/opt/tedge-data/persist/parameter-plugins/$pname" ] && continue
-    echo "$pname" >> "$MOD_DIR/parameter-plugins/.shipped"
-done
-
+# Anything the operator added or changed inside the old tree was copied out by
+# bin/tedge-persist (from etc/uninstall, which ICR-OS runs on an upgrade too, and
+# from etc/init stop). Put it back now -- BEFORE the registration helpers below,
+# which are idempotent and refresh this version's own entries on top of it.
 [ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" restore || true
 
 # Convenience: expose the tedge CLI on the system PATH.
@@ -251,5 +234,12 @@ fi
 for s in mosquitto tedge-mapper-c8y tedge-agent; do
     ln -sf "$MOD_DIR/services-init.d/S99$s" "$PREFIX/etc/init.d/S99$s"
 done
+
+# Everything above created files inside the module tree that the app owns but
+# the package did not contain: the sm-plugin symlinks, the entries registered in
+# the plugin TOMLs. Adopt them into the baseline so the next upgrade does not
+# mistake them for the operator's. Files that came out of the persistent store
+# are the operator's and are never adopted.
+[ -x "$MOD_DIR/bin/tedge-persist" ] && "$MOD_DIR/bin/tedge-persist" baseline-add || true
 
 exit 0
