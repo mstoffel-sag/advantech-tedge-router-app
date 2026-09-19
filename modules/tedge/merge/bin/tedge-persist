@@ -3,6 +3,8 @@
 #
 #   tedge-persist baseline      record what this version ships (install, pristine tree)
 #   tedge-persist baseline-add  record what the app itself created during install
+#   tedge-persist baseline-seal record what thin-edge generates at its first run
+#                               (once per install; from etc/init after a start)
 #   tedge-persist save          persist every file that is new or changed since then
 #   tedge-persist restore       put those files back (install, after `baseline`)
 #   tedge-persist status        show what is held
@@ -43,13 +45,16 @@
 # `save` runs from etc/uninstall (which ICR-OS also runs on an upgrade, right
 # before the tree is replaced) and from etc/init stop, so an interrupted upgrade
 # still has a recent copy. `baseline`, `restore` and `baseline-add` run from
-# etc/install, in that order.
+# etc/install, in that order, and `baseline-seal` from etc/init after the first
+# start that follows an install.
 set -u
 
 MOD_DIR=/opt/tedge
 PERSIST=/opt/tedge-data/persist
 STORE=$PERSIST/files          # the operator's files, keyed by path relative to MOD_DIR
 BASE=$PERSIST/baseline        # what the installed version ships, same layout
+SEAL=$PERSIST/.baseline-sealed # set once the runtime-generated files are in it
+RESTORED=$PERSIST/.restored   # what the last restore put back: the operator's, definitively
 TMPL=/tmp/.tedge-persist.$$   # scratch file lists
 
 # The configuration surface: where operator-owned content can legitimately live.
@@ -68,6 +73,9 @@ log() { echo "tedge-persist: $1"; }
 # as absent -- which made sm-plugins/container look operator-added on every save.
 # Ask about the entry itself.
 exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# Did the last restore put this path back? Then it is the operator's.
+is_restored() { grep -qx "$1" "$RESTORED" 2>/dev/null; }
 
 cleanup() { rm -f "$TMPL" "$TMPL.raw"; }
 trap cleanup EXIT
@@ -155,24 +163,52 @@ baseline() {
     done < "$TMPL"
     rm -rf "$BASE"
     mv "$BASE.new" "$BASE" || return 1
+    rm -f "$SEAL"        # this version has yet to record what it generates at run time
     log "recorded $(count_files "$BASE") shipped file(s) as this version's baseline"
 }
 
 # baseline-add -- files the APP creates after the baseline is taken: the
 # sm-plugin symlinks, the entries etc/install registers in the plugin TOMLs.
-# Without this they would look operator-added at the next save. A file that came
-# out of the store belongs to the operator and is never adopted here.
+# Without this they would look operator-added at the next save.
+#
+# What is NOT adopted is what `restore` just put back -- that is the operator's,
+# and adopting it would silently drop it from the next save. The test is the
+# restore list, not "is it in the store": the store can also hold files an
+# earlier `save` picked up before the baseline was sealed (a stop during the
+# very first start, for instance), and those must still be adoptable.
 baseline_add() {
     [ -d "$BASE" ] || return 0
     surface_of "$MOD_DIR"
     n=0
     while read -r rel; do
         exists "$BASE/$rel" && continue
-        exists "$STORE/$rel" && continue
+        is_restored "$rel" && continue
         copy_into "$MOD_DIR" "$BASE" "$rel" && n=$((n + 1))
     done < "$TMPL"
     [ "$n" -gt 0 ] && log "adopted $n file(s) created during install into the baseline"
     return 0
+}
+
+# baseline-seal -- what THIN-EDGE generates the first time it runs: the workflow
+# files it renders from operations/*.toml.template, the built-in operations it
+# writes into operations/c8y/, mappers/<cloud>/mapper.toml, the bridge rules.
+# None of those exist while etc/install is running, so the baseline cannot
+# contain them and every one of them would look operator-added forever -- which
+# on the next upgrade would hand the router last version's plumbing back.
+#
+# Done ONCE per install (etc/init calls it at the end of a start; `baseline`
+# clears the seal for the next version), and never for a file that is already in
+# the store: that one is the operator's, and adopting it would silently drop it
+# from the next save. Anything generated later than the first start is carried
+# instead of adopted -- harmless, it lands beside the new version's copy as
+# <file>.dist.
+# ---------------------------------------------------------------------------
+baseline_seal() {
+    [ -d "$BASE" ] || return 0
+    [ -f "$SEAL" ] && return 0
+    baseline_add
+    : > "$SEAL"
+    log "baseline sealed for this version"
 }
 
 # ---------------------------------------------------------------------------
@@ -250,8 +286,10 @@ restore() {
     find "$STORE" -type f >> "$TMPL.raw" 2>/dev/null
     find "$STORE" -type l >> "$TMPL.raw" 2>/dev/null
     n=0
+    : > "$RESTORED"
     while read -r p; do
         rel=${p#"$STORE"/}
+        echo "$rel" >> "$RESTORED"
         dest=$MOD_DIR/$rel
         if exists "$dest" && ! same_file "$p" "$dest"; then
             cp -a "$dest" "$dest.dist" 2>/dev/null
@@ -311,7 +349,8 @@ status() {
         echo "  (nothing held yet -- run: tedge-persist save)"
     fi
     if [ -d "$BASE" ]; then
-        echo "  baseline: $(count_files "$BASE") shipped file(s) recorded"
+        if [ -f "$SEAL" ]; then sealed="sealed"; else sealed="not sealed yet"; fi
+        echo "  baseline: $(count_files "$BASE") shipped file(s) recorded, $sealed"
     else
         echo "  baseline: none (the legacy list is used on save)"
     fi
@@ -319,10 +358,11 @@ status() {
 }
 
 case "${1:-}" in
-    baseline)     baseline ;;
-    baseline-add) baseline_add ;;
+    baseline)      baseline ;;
+    baseline-add)  baseline_add ;;
+    baseline-seal) baseline_seal ;;
     save)         save ;;
     restore)      restore ;;
     status)       status ;;
-    *) echo "usage: tedge-persist {baseline|baseline-add|save|restore|status}" >&2; exit 2 ;;
+    *) echo "usage: tedge-persist {baseline|baseline-add|baseline-seal|save|restore|status}" >&2; exit 2 ;;
 esac

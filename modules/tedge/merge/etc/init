@@ -707,6 +707,13 @@ start_tedge() {
 
     # Self-heal the c8y-ca first-connect subscription race (see the function).
     heal_mapper_subscriptions
+
+    # Everything thin-edge generates on its first run now exists (the rendered
+    # workflows, the built-in operations, the mapper and bridge files). Fold it
+    # into the upgrade baseline, once per installed version, so it is recognised
+    # as this app's own rather than carried forward as if the operator had put
+    # it there. See bin/tedge-persist (baseline-seal).
+    [ -x "$BIN/tedge-persist" ] && "$BIN/tedge-persist" baseline-seal >/dev/null 2>&1
 }
 
 stop_tedge() {
