@@ -124,6 +124,14 @@ fi
 # so it is retrievable/updatable from Cumulocity out of the box. We only ship the
 # bin/tedge-config-register helper (chmod'd above) so extension modules can add
 # their own files to that list without clobbering it (see docs/EXTENSION-API.md).
+#
+# Do NOT register the list itself here: thin-edge 2.x's file config plugin
+# already exposes plugins/tedge-configuration-plugin.toml as the config type
+# "tedge-configuration-plugin" implicitly. Adding an explicit [[files]] entry
+# for it makes the plugin abort with "The config file has the duplicated type
+# 'tedge-configuration-plugin'" and announce that single type instead of the
+# whole list -- verified on the device. So the list is snapshottable from
+# Cumulocity out of the box; nothing to add.
 
 # Log management: the bundled plugins/tedge-log-plugin.toml only registers
 # thin-edge.io's own workflow/software-management logs. Register the router's

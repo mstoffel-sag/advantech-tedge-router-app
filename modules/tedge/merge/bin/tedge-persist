@@ -42,6 +42,36 @@ PLUGIN_DIR="$MOD_DIR/parameter-plugins"
 PLUGIN_MANIFEST="$PLUGIN_DIR/.shipped"
 CONFIGS="metrics relay container parameters settings"
 
+# Cloud-editable files that live INSIDE the module tree, relative to MOD_DIR.
+# Same problem as etc/*, different directory -- and they were missed:
+#
+#   * plugins/tedge-configuration-plugin.toml lists every file Cumulocity may
+#     snapshot/update. The bundle ships four base entries and etc/install re-adds
+#     the app's own with tedge-config-register, so an upgrade LOOKED fine -- but
+#     every entry the operator had added was gone, silently.
+#   * plugins/tedge-log-plugin.toml is the same story for log types, and it is
+#     itself editable from the cloud (config type "tedge-log-plugin").
+#   * plugins/tedge-container-plugin.toml (filters, metrics interval, shared
+#     network) is advertised as cloud-editable in the README, and an upgrade
+#     reverted it to the shipped defaults.
+#   * tedge.toml holds everything the operator set with `tedge config set`.
+#     etc/init re-derives device.id and the certificate paths from the module
+#     settings on every start, but nothing else survived.
+#   * mappers/c8y/mapper.toml is where thin-edge 2.x actually keeps the cloud
+#     connection (url, auth_method, credentials_path) -- NOT tedge.toml, which
+#     is what one would assume. etc/init rewrites url and auth method at every
+#     start, so the device came back online and the loss stayed invisible.
+#
+# Restore runs BEFORE etc/install's tedge-config-register / tedge-log-register
+# calls, and those are idempotent (marker-delimited blocks), so the operator's
+# file comes back and this version's own entries are refreshed on top of it.
+#
+# Deliberately NOT carried: system.toml and env (pure app plumbing -- carrying
+# them would freeze this app's service wiring at the version the router was
+# first installed with) and ca-certificates.crt (carrying it would pin an
+# outdated root store).
+TREE_CONFIGS="plugins/tedge-configuration-plugin.toml plugins/tedge-log-plugin.toml plugins/tedge-container-plugin.toml tedge.toml mappers/c8y/mapper.toml"
+
 log() { echo "tedge-persist: $1"; }
 
 # The two layouts differ in depth, so each has its own id helper:
@@ -103,6 +133,13 @@ save() {
         cp -a "$MOD_DIR/etc/$f" "$PERSIST/etc/$f"
     done
     chmod 600 "$PERSIST/etc/settings" 2>/dev/null || true
+
+    # Cloud-editable files inside the module tree (keeping their relative path).
+    for rel in $TREE_CONFIGS; do
+        [ -f "$MOD_DIR/$rel" ] || continue
+        mkdir -p "$PERSIST/tree/$(dirname "$rel")" 2>/dev/null || continue
+        cp -a "$MOD_DIR/$rel" "$PERSIST/tree/$rel"
+    done
     return 0
 }
 
@@ -150,6 +187,18 @@ restore() {
         cp -a "$PERSIST/etc/$f" "$MOD_DIR/etc/$f"
     done
     chmod 600 "$MOD_DIR/etc/settings" 2>/dev/null || true
+
+    # Same rule for the in-tree files: yours wins, the shipped one is kept
+    # alongside as *.dist so entries a new version introduces stay discoverable.
+    for rel in $TREE_CONFIGS; do
+        [ -f "$PERSIST/tree/$rel" ] || continue
+        mkdir -p "$MOD_DIR/$(dirname "$rel")" 2>/dev/null || true
+        if [ -f "$MOD_DIR/$rel" ] && ! same_file "$PERSIST/tree/$rel" "$MOD_DIR/$rel"; then
+            cp -a "$MOD_DIR/$rel" "$MOD_DIR/$rel.dist"
+            log "kept your $rel (this version ships $rel.dist)"
+        fi
+        cp -a "$PERSIST/tree/$rel" "$MOD_DIR/$rel"
+    done
     return 0
 }
 
@@ -165,6 +214,9 @@ status() {
     done
     for f in $CONFIGS; do
         [ -f "$PERSIST/etc/$f" ] && echo "  config: etc/$f"
+    done
+    for rel in $TREE_CONFIGS; do
+        [ -f "$PERSIST/tree/$rel" ] && echo "  config: $rel"
     done
     [ -f "$MANIFEST" ] && echo "  shipped flows recorded: $(wc -l < "$MANIFEST")"
     return 0
