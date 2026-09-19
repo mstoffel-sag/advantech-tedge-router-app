@@ -1,6 +1,27 @@
 thin-edge.io Router App - Changelog
 ===================================
 
+1.1.1
+------
+* bin/tedge-persist: adopt what THIN-EDGE generates on its first run. The 1.1.0
+  baseline is taken while etc/install runs, so it cannot contain the files tedge
+  itself writes when it first starts -- the workflows rendered from
+  operations/*.toml.template, the built-in operations under operations/c8y/,
+  mappers/<cloud>/mapper.toml, the bridge rules. All 13 of them looked
+  operator-added on the real 1.0.17 -> 1.1.0 upgrade of the test router, which
+  would have handed that router last version's plumbing back on its next
+  upgrade -- the exact failure the baseline was meant to prevent.
+    - New `tedge-persist baseline-seal`, called by etc/init at the end of a
+      start and done once per installed version (`baseline` clears the seal),
+      folds those files into the baseline.
+    - What is NOT adopted is what `restore` put back. `restore` now records that
+      list (/opt/tedge-data/persist/.restored) and the adopt step consults it
+      instead of asking whether a file is in the store -- the store can also
+      hold files an earlier `save` picked up before the baseline was sealed (a
+      stop during the very first start), and those must stay adoptable, while an
+      operator file must never be adopted or the next save would drop it.
+* `tedge-persist status` reports whether the baseline is sealed.
+
 1.1.0
 ------
 * bin/tedge-persist no longer carries a hand-maintained LIST of files across an

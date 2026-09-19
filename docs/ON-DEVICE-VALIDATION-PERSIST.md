@@ -67,10 +67,42 @@ only operator content.
   restoring it then failed (6 saved, 5 restored). Both fixed; counts now agree.
 - ✔ `status` used `sort`, which this firmware's busybox does not have.
 
-## 5. Not covered here
+## 5. The real upgrade, 1.0.17 → 1.1.0 (2026-09-19)
 
-- ☐ A real ICR-OS install of the 1.1.0 package over 1.0.17 on this router — the
-  cycle above was driven by hand against sandboxed trees with the real script.
-  That is the one test left, and it is the one that exercises `etc/install`'s
-  ordering (`baseline` → `restore` → registration helpers → `baseline-add`).
+Installed as a Router App through the web interface, on the router that had been
+migrated to the SAP tenant the day before.
+
+- ✔ `etc/version` reads `1.1.0`; the 1.0.19-layout store was migrated to the
+  per-path layout and a baseline of 50 shipped files recorded.
+- ✔ Everything came back: the four restored `[[files]]` entries (14 config types
+  announced again), the `relay-auto-open` flow with all six of its files, the
+  `relayAutoOffTime` parameter plugin, `etc/{settings,metrics,relay,parameters}`,
+  the three plugin TOMLs, `tedge.toml` and `mappers/c8y/mapper.toml`. `.dist`
+  copies were written where 1.1.0 ships something different.
+- ✔ All daemons up, device online on the SAP tenant as `advantec-gateway`.
+
+**Finding that led to 1.1.1:** a `save` right after that upgrade reported 30
+files where the store held 17. The 13 extra are what **thin-edge generates on
+its first run** — `operations/c8y/{c8y_Restart,c8y_SoftwareUpdate,…}`,
+`operations/{config_update,device_profile}.toml`, `mappers/*/mapper.toml`,
+`mappers/c8y/bridge/mqtt-core.toml` — none of which exist while `etc/install`
+takes the baseline, so all of them looked operator-added. Left alone, the next
+upgrade would have restored last version's plumbing over the new one: the very
+failure the baseline was meant to prevent.
+
+- ✔ Fixed with `baseline-seal` (etc/init calls it at the end of a start, once per
+  installed version) and verified live: 13 files adopted, and a following `save`
+  dropped from 31 to 18 — the operator's files, plus `etc/init` (hand-patched on
+  this router at the time) and the `az`/`aws` `mapper.toml` that tedge rewrites.
+- ✔ Adoption is decided by the restore list (`persist/.restored`), not by store
+  membership, so a `save` that ran before the seal (a stop during the first
+  start) cannot make a generated file permanently un-adoptable — while a file
+  `restore` put back is never adopted.
+
+## 6. Not covered here
+
+- ☐ A clean install of 1.1.1 exercising `baseline` → `restore` → registration
+  helpers → `baseline-add` → (first start) `baseline-seal` end to end; the seal
+  was verified on a router whose store had already been polluted, by
+  reconstructing `.restored` by hand.
 - ☐ Platforms `v2i`, `v3`, `v4i`.
