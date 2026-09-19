@@ -5,6 +5,8 @@
 #   tedge-persist baseline-add  record what the app itself created during install
 #   tedge-persist baseline-seal record what thin-edge generates at its first run
 #                               (once per install; from etc/init after a start)
+#   tedge-persist baseline-reseal  seal again once the start has settled -- some
+#                               of those files are written minutes in
 #   tedge-persist save          persist every file that is new or changed since then
 #   tedge-persist restore       put those files back (install, after `baseline`)
 #   tedge-persist status        show what is held
@@ -378,8 +380,9 @@ case "${1:-}" in
     baseline)      baseline ;;
     baseline-add)  baseline_add ;;
     baseline-seal) baseline_seal ;;
+    baseline-reseal) rm -f "$SEAL"; baseline_seal ;;
     save)         save ;;
     restore)      restore ;;
     status)       status ;;
-    *) echo "usage: tedge-persist {baseline|baseline-add|baseline-seal|save|restore|status}" >&2; exit 2 ;;
+    *) echo "usage: tedge-persist {baseline|baseline-add|baseline-seal|baseline-reseal|save|restore|status}" >&2; exit 2 ;;
 esac

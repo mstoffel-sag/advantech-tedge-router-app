@@ -133,6 +133,41 @@ route.
   before the seal existed) were removed from the store by hand. A clean install
   cannot produce them.
 
-## 7. Not covered here
+## 7. The 1.1.2 install, and why the seal has to happen twice (2026-09-19)
+
+- ✔ `1.1.2` installed, baseline sealed, the operator's 15 files restored.
+- **Finding:** a `save` afterwards showed three `operations/c8y/*` files back in
+  the store (`c8y_UploadConfigFile`, `c8y_LogfileRequest`,
+  `c8y_DownloadConfigFile`). The mapper rewrites them when the agent publishes
+  those capabilities — *after* `start_tedge` has finished, so the seal at the end
+  of the start cannot have seen them. Sealing is a timing bet, not a one-shot.
+- ✔ 1.1.3 re-seals 3 minutes after a start (`tedge-persist baseline-reseal`).
+  Verified end to end: with the seal cleared, a `etc/init restart` sealed
+  immediately, the background re-seal fired on its own, and a following `save`
+  held exactly the operator's 15 files.
+
+## 8. Adjacent finding — single-file bind mounts and config updates
+
+Not a Router App bug, but it looks like one from Cumulocity. The vision-demo
+container bind-mounts individual files:
+
+```yaml
+- /opt/vision_demo/pipeline/processors/preprocessor.py:/opt/tedge-pipeline/processors/preprocessor.py
+```
+
+A single-file bind mount binds the **inode**. thin-edge writes a config update
+atomically — temp file, then `rename()` — which produces a NEW inode, so the
+host file is updated (and snapshots read it back correctly) while the running
+container keeps reading the old one. Reproduced on the device: after an atomic
+write the inode went 422 → 11923 and the container still served the previous
+content (16772 B vs 16798 B).
+
+Fix in the compose file: mount the **directories**
+(`…/processors:/opt/tedge-pipeline/processors`), where a rename inside the
+directory is visible to the container, and recreate it. The same rename
+behaviour is why the module's own persistent files cannot be symlinked into
+`/opt/tedge-data` (see `bin/tedge-persist`).
+
+## 9. Not covered here
 
 - ☐ Platforms `v2i`, `v3`, `v4i`.
