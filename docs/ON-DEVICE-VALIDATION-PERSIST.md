@@ -99,10 +99,40 @@ failure the baseline was meant to prevent.
   start) cannot make a generated file permanently un-adoptable — while a file
   `restore` put back is never adopted.
 
-## 6. Not covered here
+## 6. The clean 1.1.1 install (2026-09-19)
 
-- ☐ A clean install of 1.1.1 exercising `baseline` → `restore` → registration
-  helpers → `baseline-add` → (first start) `baseline-seal` end to end; the seal
-  was verified on a router whose store had already been polluted, by
-  reconstructing `.restored` by hand.
+Installed as a Router App over 1.1.0 — the first run of the whole sequence
+(`baseline` → `restore` → registration helpers → `baseline-add` → first start's
+`baseline-seal`) with no hand-made state.
+
+- ✔ `1.1.1`, baseline of 59 shipped files recorded and reported **sealed**,
+  `.restored` listing the 18 files put back.
+- ✔ Every operator artifact survived again (the four `[[files]]` entries, 14
+  config types announced, the flow with all six files, the parameter plugin, the
+  configs), device online, all daemons up.
+- ✔ `etc/init` dropped out of the store: it was only ever there because the file
+  had been hand-patched on this router, and the shipped 1.1.1 copy now matches.
+
+**Finding that led to 1.1.2:** four `operations/c8y/*` files were still counted
+as changed. thin-edge does not only *generate* files on its first run, it also
+**rewrites files it ships** (`c8y_SoftwareUpdate`, `c8y_LogfileRequest`,
+`c8y_UploadConfigFile`, `c8y_DownloadConfigFile`, and `mappers/<cloud>/mapper.toml`).
+Those are in the baseline but no longer match it, and `baseline-seal` only
+*added* what the baseline was missing — so they were carried across every
+upgrade as operator content, which is the old plumbing coming back by another
+route.
+
+- ✔ 1.1.2 makes the seal re-record what it seals. Verified live: the four files
+  dropped out and the store came down to the operator's own 15
+  (`mappers/c8y/mapper.toml`, the six flow files, `tedge.toml`,
+  `etc/{settings,metrics,relay,parameters}`, two plugin TOMLs, the parameter
+  plugin).
+- **Note on stickiness:** a path that `restore` put back is never re-adopted, by
+  design — so a file that once entered the store wrongly stays there. Two such
+  (`mappers/{az,aws}/mapper.toml`, captured by a `save` run mid-development
+  before the seal existed) were removed from the store by hand. A clean install
+  cannot produce them.
+
+## 7. Not covered here
+
 - ☐ Platforms `v2i`, `v3`, `v4i`.
